@@ -2,6 +2,7 @@ import datetime
 
 from huey.api import Task
 from huey.exceptions import TaskException
+from huey.exceptions import TaskNotFound
 from huey.signals import SIGNAL_DEAD_LETTER
 from huey.signals import SIGNAL_ERROR
 from huey.signals import SIGNAL_EXECUTING
@@ -394,8 +395,9 @@ class TestDeadLetterQueue(BaseTestCase):
     def test_requeue_dead_letter_nonexistent_id(self):
         self.assertEqual(self.huey.dead_letter_count(), 0)
 
-        result = self.huey.requeue_dead_letter('non-existent-id-12345')
-        self.assertIsNone(result)
+        with self.assertRaises(TaskNotFound) as ctx:
+            self.huey.requeue_dead_letter('non-existent-id-12345')
+        self.assertIn('non-existent-id-12345', str(ctx.exception))
         self.assertEqual(self.huey.pending_count(), 0)
 
         @self.huey.task()
@@ -407,8 +409,9 @@ class TestDeadLetterQueue(BaseTestCase):
 
         self.assertEqual(self.huey.dead_letter_count(), 1)
 
-        result2 = self.huey.requeue_dead_letter('another-non-existent-id')
-        self.assertIsNone(result2)
+        with self.assertRaises(TaskNotFound) as ctx:
+            self.huey.requeue_dead_letter('another-non-existent-id')
+        self.assertIn('another-non-existent-id', str(ctx.exception))
         self.assertEqual(self.huey.dead_letter_count(), 1)
         self.assertEqual(self.huey.pending_count(), 0)
 
@@ -423,7 +426,8 @@ class TestDeadLetterQueue(BaseTestCase):
         self.assertIsNone(self.huey.peek_dead_letter('any-id'))
         self.assertIsNone(self.huey.get_dead_letter('any-id'))
         self.assertFalse(self.huey.delete_dead_letter('any-id'))
-        self.assertIsNone(self.huey.requeue_dead_letter('any-id'))
+        with self.assertRaises(TaskNotFound):
+            self.huey.requeue_dead_letter('any-id')
 
         tasks = self.huey.dead_letter_tasks()
         self.assertEqual(len(tasks), 0)
@@ -440,7 +444,8 @@ class TestDeadLetterQueue(BaseTestCase):
         self.assertIsNone(self.huey.peek_dead_letter(''))
         self.assertIsNone(self.huey.get_dead_letter(''))
         self.assertFalse(self.huey.delete_dead_letter(''))
-        self.assertIsNone(self.huey.requeue_dead_letter(''))
+        with self.assertRaises(TaskNotFound):
+            self.huey.requeue_dead_letter('')
 
     def test_dead_letter_with_special_characters_id(self):
         special_ids = [
@@ -460,7 +465,8 @@ class TestDeadLetterQueue(BaseTestCase):
             self.assertIsNone(self.huey.peek_dead_letter(task_id))
             self.assertIsNone(self.huey.get_dead_letter(task_id))
             self.assertFalse(self.huey.delete_dead_letter(task_id))
-            self.assertIsNone(self.huey.requeue_dead_letter(task_id))
+            with self.assertRaises(TaskNotFound):
+                self.huey.requeue_dead_letter(task_id)
 
     def test_dead_letter_operations_idempotent(self):
         @self.huey.task()

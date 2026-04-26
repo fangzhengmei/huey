@@ -24,6 +24,7 @@ from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
+from huey.exceptions import TaskNotFound
 from huey.exceptions import TaskTimeout
 from huey.registry import Registry
 from huey.serializer import Serializer
@@ -868,7 +869,7 @@ class Huey(object):
                              priority=None, eta=None):
         data = self.get_dead_letter(task_id)
         if data is None:
-            return None
+            raise TaskNotFound('Dead letter task not found: %s' % task_id)
         task = self.deserialize_task(data['task_data'])
         if retries is not None:
             task.retries = retries

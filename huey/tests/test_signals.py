@@ -65,7 +65,7 @@ class TestSignals(BaseTestCase):
         self.assertSignals([SIGNAL_EXECUTING, SIGNAL_ERROR, SIGNAL_RETRYING,
                             SIGNAL_ENQUEUED])
         self.assertTrue(self.execute_next() is None)
-        self.assertSignals([SIGNAL_EXECUTING, SIGNAL_ERROR])
+        self.assertSignals([SIGNAL_EXECUTING, SIGNAL_ERROR, SIGNAL_DEAD_LETTER])
 
         @self.huey.task(retries=1, retry_delay=60)
         def task_b(n):

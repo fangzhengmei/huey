@@ -537,6 +537,8 @@ class Huey(object):
         if exception is not None and task.retries:
             self._emit(S.SIGNAL_RETRYING, task)
             self._requeue_task(task, self._get_timestamp(), retry_eta)
+        elif exception is not None and not task.retries:
+            self.put_dead_letter(task, exception)
 
         return task_value
 
@@ -789,6 +791,102 @@ class Huey(object):
             max_delay=max_delay,
             revoke_on_timeout=revoke_on_timeout,
             preserve=preserve)
+
+    def _dead_letter_key(self, task_id):
+        return 'dl:%s:%s' % (self.name, task_id)
+
+    def _dead_letter_prefix(self):
+        return 'dl:%s:' % self.name
+
+    def put_dead_letter(self, task, exception, timestamp=None):
+        if timestamp is None:
+            timestamp = self._get_timestamp()
+        try:
+            tb = traceback.format_exc()
+        except AttributeError:
+            tb = '- unable to resolve traceback -'
+        if isinstance(exception, TaskException):
+            error = exception.metadata.get('error') or repr(exception)
+        else:
+            error = repr(exception)
+        dead_letter_data = {
+            'task_id': task.id,
+            'task_name': task.name,
+            'task_data': self.serialize_task(task),
+            'error': error,
+            'traceback': tb,
+            'failed_at': timestamp,
+            'original_retries': task.retries,
+        }
+        key = self._dead_letter_key(task.id)
+        self.put(key, dead_letter_data)
+        self._emit(S.SIGNAL_DEAD_LETTER, task, exception, dead_letter_data)
+        logger.warning('Task %s moved to dead-letter queue', task.id)
+
+    def peek_dead_letter(self, task_id):
+        key = self._dead_letter_key(task_id)
+        return self.get(key, peek=True)
+
+    def get_dead_letter(self, task_id):
+        key = self._dead_letter_key(task_id)
+        return self.get(key, peek=False)
+
+    def delete_dead_letter(self, task_id):
+        key = self._dead_letter_key(task_id)
+        return self.delete(key)
+
+    def dead_letter_count(self):
+        prefix = self._dead_letter_prefix()
+        results = self.storage.result_items()
+        count = 0
+        for key in results:
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+            if key.startswith(prefix):
+                count += 1
+        return count
+
+    def dead_letter_tasks(self, limit=None):
+        prefix = self._dead_letter_prefix()
+        results = self.storage.result_items()
+        tasks = []
+        for key, value in results.items():
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+            if key.startswith(prefix):
+                if isinstance(value, bytes):
+                    try:
+                        value = self.serializer.deserialize(value)
+                    except Exception:
+                        continue
+                tasks.append(value)
+                if limit and len(tasks) >= limit:
+                    break
+        return tasks
+
+    def requeue_dead_letter(self, task_id, retries=None, retry_delay=None,
+                             priority=None, eta=None):
+        data = self.get_dead_letter(task_id)
+        if data is None:
+            return None
+        task = self.deserialize_task(data['task_data'])
+        if retries is not None:
+            task.retries = retries
+        if retry_delay is not None:
+            task.retry_delay = retry_delay
+        if priority is not None:
+            task.priority = priority
+        if eta is not None:
+            task.eta = normalize_time(eta, None, self.utc)
+        result = self.enqueue(task)
+        logger.info('Task %s requeued from dead-letter queue', task_id)
+        return result
+
+    def flush_dead_letter(self):
+        tasks = self.dead_letter_tasks()
+        for task_data in tasks:
+            self.delete_dead_letter(task_data['task_id'])
+        return len(tasks)
 
 
 class Task(object):

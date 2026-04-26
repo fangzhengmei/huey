@@ -327,3 +327,161 @@ class TestDeadLetterQueue(BaseTestCase):
 
         dl = self.huey.dead_letter_tasks()[0]
         self.assertEqual(dl['task_id'], new_r.id)
+
+    def test_peek_dead_letter_nonexistent_id(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        result = self.huey.peek_dead_letter('non-existent-id-12345')
+        self.assertIsNone(result)
+
+        @self.huey.task()
+        def bad_task():
+            raise TestError('fail')
+
+        r = bad_task()
+        self.execute_next()
+
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        result2 = self.huey.peek_dead_letter('another-non-existent-id')
+        self.assertIsNone(result2)
+
+        result3 = self.huey.peek_dead_letter(r.id)
+        self.assertIsNotNone(result3)
+
+    def test_get_dead_letter_nonexistent_id(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        result = self.huey.get_dead_letter('non-existent-id-12345')
+        self.assertIsNone(result)
+
+        @self.huey.task()
+        def bad_task():
+            raise TestError('fail')
+
+        r = bad_task()
+        self.execute_next()
+
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        result2 = self.huey.get_dead_letter('another-non-existent-id')
+        self.assertIsNone(result2)
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+    def test_delete_dead_letter_nonexistent_id(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        result = self.huey.delete_dead_letter('non-existent-id-12345')
+        self.assertFalse(result)
+
+        @self.huey.task()
+        def bad_task():
+            raise TestError('fail')
+
+        r = bad_task()
+        self.execute_next()
+
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        result2 = self.huey.delete_dead_letter('another-non-existent-id')
+        self.assertFalse(result2)
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        result3 = self.huey.delete_dead_letter(r.id)
+        self.assertTrue(result3)
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+    def test_requeue_dead_letter_nonexistent_id(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        result = self.huey.requeue_dead_letter('non-existent-id-12345')
+        self.assertIsNone(result)
+        self.assertEqual(self.huey.pending_count(), 0)
+
+        @self.huey.task()
+        def bad_task():
+            raise TestError('fail')
+
+        r = bad_task()
+        self.execute_next()
+
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        result2 = self.huey.requeue_dead_letter('another-non-existent-id')
+        self.assertIsNone(result2)
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+        self.assertEqual(self.huey.pending_count(), 0)
+
+        result3 = self.huey.requeue_dead_letter(r.id)
+        self.assertIsNotNone(result3)
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+        self.assertEqual(self.huey.pending_count(), 1)
+
+    def test_empty_dead_letter_queue_operations(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        self.assertIsNone(self.huey.peek_dead_letter('any-id'))
+        self.assertIsNone(self.huey.get_dead_letter('any-id'))
+        self.assertFalse(self.huey.delete_dead_letter('any-id'))
+        self.assertIsNone(self.huey.requeue_dead_letter('any-id'))
+
+        tasks = self.huey.dead_letter_tasks()
+        self.assertEqual(len(tasks), 0)
+
+        tasks_limited = self.huey.dead_letter_tasks(limit=5)
+        self.assertEqual(len(tasks_limited), 0)
+
+        flushed = self.huey.flush_dead_letter()
+        self.assertEqual(flushed, 0)
+
+    def test_dead_letter_with_empty_string_id(self):
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        self.assertIsNone(self.huey.peek_dead_letter(''))
+        self.assertIsNone(self.huey.get_dead_letter(''))
+        self.assertFalse(self.huey.delete_dead_letter(''))
+        self.assertIsNone(self.huey.requeue_dead_letter(''))
+
+    def test_dead_letter_with_special_characters_id(self):
+        special_ids = [
+            'id with spaces',
+            'id-with-dashes',
+            'id_with_underscores',
+            'id.with.dots',
+            'id@#$%^&*()',
+            '12345',
+            'null',
+            'None',
+            'true',
+            'false',
+        ]
+
+        for task_id in special_ids:
+            self.assertIsNone(self.huey.peek_dead_letter(task_id))
+            self.assertIsNone(self.huey.get_dead_letter(task_id))
+            self.assertFalse(self.huey.delete_dead_letter(task_id))
+            self.assertIsNone(self.huey.requeue_dead_letter(task_id))
+
+    def test_dead_letter_operations_idempotent(self):
+        @self.huey.task()
+        def bad_task():
+            raise TestError('fail')
+
+        r = bad_task()
+        self.execute_next()
+
+        self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        for _ in range(3):
+            dl = self.huey.peek_dead_letter(r.id)
+            self.assertIsNotNone(dl)
+            self.assertEqual(self.huey.dead_letter_count(), 1)
+
+        dl = self.huey.get_dead_letter(r.id)
+        self.assertIsNotNone(dl)
+        self.assertEqual(self.huey.dead_letter_count(), 0)
+
+        for _ in range(3):
+            dl2 = self.huey.get_dead_letter(r.id)
+            self.assertIsNone(dl2)
+            self.assertEqual(self.huey.dead_letter_count(), 0)

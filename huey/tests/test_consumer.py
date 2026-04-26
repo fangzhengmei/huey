@@ -65,6 +65,37 @@ class TestConsumerIntegration(BaseTestCase):
             self.assertEqual(exc.metadata['error'],
                              'TaskTimeout(\'timeout 0.1s\')')
 
+    @slow_test()
+    def test_consumer_timeout_hard_interrupt(self):
+        @self.huey.task(timeout=0.05)
+        def cpu_bound_task():
+            while True:
+                for _ in range(10000):
+                    pass
+
+        @self.huey.task(timeout=10)
+        def quick_task():
+            return 42
+
+        r1 = quick_task()
+        r2 = cpu_bound_task()
+        consumer = self.consumer(workers=1)
+        self.work_on_tasks(consumer, 2)
+
+        self.assertEqual(r1.get(), 42)
+
+        self.assertEqual(self.huey.result_count(), 2)
+
+        with self.assertRaises(TaskException):
+            r2.get()
+        try:
+            r2.get()
+        except TaskException as exc:
+            self.assertIn('TaskTimeout', exc.metadata['error'])
+            self.assertEqual(exc.metadata['task_id'], r2.id)
+            self.assertIn('traceback', exc.metadata)
+            self.assertIn('retries', exc.metadata)
+
     def test_consumer_schedule_task(self):
         @self.huey.task()
         def task_a(n):

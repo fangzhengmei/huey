@@ -16,4 +16,5 @@ from huey.api import crontab
 from huey.api import group
 from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask
+from huey.exceptions import TaskNotFound
 from huey.utils import Error

@@ -1,5 +1,7 @@
 import datetime
+import logging
 import time
+import unittest.mock as mock
 
 from huey.api import crontab
 from huey.consumer import Consumer
@@ -95,6 +97,41 @@ class TestConsumerIntegration(BaseTestCase):
             self.assertEqual(exc.metadata['task_id'], r2.id)
             self.assertIn('traceback', exc.metadata)
             self.assertIn('retries', exc.metadata)
+
+    @slow_test()
+    def test_consumer_timeout_logging(self):
+        @self.huey.task(timeout=0.05)
+        def cpu_bound_task():
+            while True:
+                for _ in range(10000):
+                    pass
+
+        with mock.patch('huey.utils.logger') as mock_utils_logger:
+            with mock.patch('huey.logger') as mock_huey_logger:
+                r = cpu_bound_task()
+                consumer = self.consumer(workers=1)
+                self.work_on_tasks(consumer, 1)
+
+                utils_log_calls = [
+                    call for call in mock_utils_logger.warning.call_args_list
+                    if 'timeout' in str(call).lower()
+                ]
+                huey_log_calls = [
+                    call for call in mock_huey_logger.warning.call_args_list
+                    if 'timed out' in str(call).lower()
+                ]
+
+                self.assertTrue(
+                    len(utils_log_calls) > 0 or len(huey_log_calls) > 0,
+                    "Timeout should be logged"
+                )
+
+        with self.assertRaises(TaskException):
+            r.get()
+        try:
+            r.get()
+        except TaskException as exc:
+            self.assertIn('TaskTimeout', exc.metadata['error'])
 
     def test_consumer_schedule_task(self):
         @self.huey.task()

@@ -1,12 +1,15 @@
 from collections import namedtuple
 import calendar
 import contextlib
+import ctypes
 import datetime
 import errno
+import inspect
 import logging
 import os
 import signal
 import sys
+import threading
 import time
 import warnings
 try:
@@ -176,9 +179,52 @@ class FileLock(object):
         self.release()
 
 
+def _async_raise(tid, exctype):
+    """
+    Raise an exception in the threads with id tid using ctypes.
+    This is not 100% safe (e.g., won't interrupt blocking system calls),
+    but it's better than no timeout at all.
+    """
+    if not inspect.isclass(exctype):
+        raise TypeError("Only types can be raised (not instances)")
+
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_long(tid),
+        ctypes.py_object(exctype))
+
+    if res == 0:
+        raise ValueError("invalid thread id")
+    elif res != 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), None)
+        raise SystemError("PyThreadState_SetAsyncExc failed")
+
+
+class _ThreadTimeoutTimer(threading.Thread):
+    """
+    A timer thread that raises TaskTimeout in the target thread when timeout occurs.
+    """
+    def __init__(self, seconds, target_tid):
+        super().__init__(daemon=True)
+        self.seconds = seconds
+        self.target_tid = target_tid
+        self._cancelled = threading.Event()
+
+    def run(self):
+        self._cancelled.wait(self.seconds)
+        if not self._cancelled.is_set():
+            try:
+                _async_raise(self.target_tid, TaskTimeout)
+            except (ValueError, SystemError):
+                pass
+
+    def cancel(self):
+        self._cancelled.set()
+
+
 @contextlib.contextmanager
 def noop_context():
     yield
+
 
 @contextlib.contextmanager
 def process_timeout(seconds):
@@ -193,9 +239,26 @@ def process_timeout(seconds):
         signal.alarm(0)  # Cancel any pending alarm.
         signal.signal(signal.SIGALRM, orig)
 
+
 @contextlib.contextmanager
 def thread_timeout(seconds):
-    yield
+    """
+    Thread-based timeout using ctypes.PyThreadState_SetAsyncExc.
+    
+    Note: This is not 100% reliable:
+    - It won't interrupt blocking system calls (e.g., time.sleep(), I/O operations)
+    - It will only raise the exception when the thread is executing Python bytecode
+    - For blocking operations, consider using cooperative timeout with check_timeout()
+    
+    However, it will interrupt CPU-bound loops and most Python code execution.
+    """
+    timer = _ThreadTimeoutTimer(seconds, threading.current_thread().ident)
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join(timeout=0.1)
 
 @contextlib.contextmanager
 def greenlet_timeout(seconds):

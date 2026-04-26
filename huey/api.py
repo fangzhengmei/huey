@@ -825,18 +825,41 @@ class Huey(object):
         logger.warning('Task %s moved to dead-letter queue', task.id)
 
     def peek_dead_letter(self, task_id):
+        """
+        Peek at a dead-letter task without removing it.
+
+        :param task_id: the task id to peek.
+        :return: the dead-letter data as a dictionary, or None if not found.
+        """
         key = self._dead_letter_key(task_id)
         return self.get(key, peek=True)
 
     def get_dead_letter(self, task_id):
+        """
+        Retrieve a dead-letter task and remove it from the queue.
+
+        :param task_id: the task id to retrieve.
+        :return: the dead-letter data as a dictionary, or None if not found.
+        """
         key = self._dead_letter_key(task_id)
         return self.get(key, peek=False)
 
     def delete_dead_letter(self, task_id):
+        """
+        Delete a dead-letter task from the queue.
+
+        :param task_id: the task id to delete.
+        :return: True if the task was deleted, False if not found.
+        """
         key = self._dead_letter_key(task_id)
         return self.delete(key)
 
     def dead_letter_count(self):
+        """
+        Return the number of dead-letter tasks in the queue.
+
+        :return: the count of dead-letter tasks.
+        """
         prefix = self._dead_letter_prefix()
         results = self.storage.result_items()
         count = 0
@@ -848,6 +871,21 @@ class Huey(object):
         return count
 
     def dead_letter_tasks(self, limit=None):
+        """
+        Return all dead-letter tasks from the queue.
+
+        The dead-letter data is a dictionary containing:
+        - task_id: the original task id
+        - task_name: the task function name
+        - task_data: serialized task data (args, kwargs, etc.)
+        - error: the error message
+        - traceback: the full traceback
+        - failed_at: timestamp when the task failed
+        - original_retries: the original number of retries
+
+        :param limit: optional maximum number of tasks to return.
+        :return: list of dead-letter data dictionaries.
+        """
         prefix = self._dead_letter_prefix()
         results = self.storage.result_items()
         tasks = []
@@ -867,6 +905,21 @@ class Huey(object):
 
     def requeue_dead_letter(self, task_id, retries=None, retry_delay=None,
                              priority=None, eta=None):
+        """
+        Requeue a dead-letter task back to the main queue.
+
+        The task is removed from the dead-letter queue and re-enqueued for
+        execution. Optionally override the task's retry settings, priority,
+        and scheduled execution time.
+
+        :param task_id: the dead-letter task id to requeue.
+        :param retries: optional new number of retries for the requeued task.
+        :param retry_delay: optional new retry delay in seconds.
+        :param priority: optional new priority for the task.
+        :param eta: optional scheduled execution time for the task.
+        :return: a :py:class:`Result` instance for the requeued task.
+        :raises TaskNotFound: if no dead-letter task exists with the given id.
+        """
         data = self.get_dead_letter(task_id)
         if data is None:
             raise TaskNotFound('Dead letter task not found: %s' % task_id)
@@ -884,6 +937,11 @@ class Huey(object):
         return result
 
     def flush_dead_letter(self):
+        """
+        Remove all dead-letter tasks from the queue.
+
+        :return: the number of tasks removed.
+        """
         tasks = self.dead_letter_tasks()
         for task_data in tasks:
             self.delete_dead_letter(task_data['task_id'])

@@ -212,6 +212,9 @@ class _ThreadTimeoutTimer(threading.Thread):
     def run(self):
         self._cancelled.wait(self.seconds)
         if not self._cancelled.is_set():
+            logger.warning('Thread timeout triggered: raising TaskTimeout '
+                           'after %ss (thread id: %s)',
+                           self.seconds, self.target_tid)
             try:
                 _async_raise(self.target_tid, TaskTimeout)
             except (ValueError, SystemError):
@@ -229,6 +232,8 @@ def noop_context():
 @contextlib.contextmanager
 def process_timeout(seconds):
     def _handle_alrm(signum, frame):
+        logger.warning('Process timeout triggered: raising TaskTimeout '
+                       'after %ss', seconds)
         raise TaskTimeout('timeout (%ss)' % seconds)
 
     orig = signal.signal(signal.SIGALRM, _handle_alrm)
@@ -267,9 +272,14 @@ def greenlet_timeout(seconds):
         yield
         return
 
+    logger.debug('Setting greenlet timeout: %ss', seconds)
     timer = gevent.Timeout(seconds, TaskTimeout('timeout (%ss)' % seconds))
     timer.start()
     try:
         yield
+    except TaskTimeout:
+        logger.warning('Greenlet timeout triggered: raising TaskTimeout '
+                       'after %ss', seconds)
+        raise
     finally:
         timer.cancel()

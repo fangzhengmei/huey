@@ -322,27 +322,32 @@ class MemoryStorage(BaseStorage):
             heapq.heappush(self._queue, (priority, self._c, data))
 
     def dequeue(self):
-        try:
-            _, _, data = heapq.heappop(self._queue)
-        except IndexError:
-            pass
-        else:
-            return data
+        with self._lock:
+            try:
+                _, _, data = heapq.heappop(self._queue)
+            except IndexError:
+                pass
+            else:
+                return data
 
     def queue_size(self):
-        return len(self._queue)
+        with self._lock:
+            return len(self._queue)
 
     def enqueued_items(self, limit=None):
-        items = [data for _, _, data in sorted(self._queue)]
-        if limit:
-            items = items[:limit]
-        return items
+        with self._lock:
+            items = [data for _, _, data in sorted(self._queue)]
+            if limit:
+                items = items[:limit]
+            return items
 
     def flush_queue(self):
-        self._queue = []
+        with self._lock:
+            self._queue = []
 
     def add_to_schedule(self, data, ts):
-        heapq.heappush(self._schedule, (ts, data))
+        with self._lock:
+            heapq.heappush(self._schedule, (ts, data))
 
     def read_schedule(self, ts):
         with self._lock:
@@ -358,28 +363,42 @@ class MemoryStorage(BaseStorage):
         return accum
 
     def schedule_size(self):
-        return len(self._schedule)
+        with self._lock:
+            return len(self._schedule)
 
     def scheduled_items(self, limit=None):
-        items = sorted(data for _, data in self._schedule)
-        if limit:
-            items = items[:limit]
-        return items
+        with self._lock:
+            items = sorted(data for _, data in self._schedule)
+            if limit:
+                items = items[:limit]
+            return items
 
     def flush_schedule(self):
-        self._schedule = []
+        with self._lock:
+            self._schedule = []
 
     def put_data(self, key, value, is_result=False):
-        self._results[key] = value
+        with self._lock:
+            self._results[key] = value
 
     def peek_data(self, key):
-        return self._results.get(key, EmptyData)
+        with self._lock:
+            return self._results.get(key, EmptyData)
 
     def pop_data(self, key):
-        return self._results.pop(key, EmptyData)
+        with self._lock:
+            return self._results.pop(key, EmptyData)
 
     def has_data_for_key(self, key):
-        return key in self._results
+        with self._lock:
+            return key in self._results
+
+    def put_if_empty(self, key, value):
+        with self._lock:
+            if key in self._results:
+                return False
+            self._results[key] = value
+            return True
 
     def incr(self, key, amount=1):
         with self._lock:
@@ -391,16 +410,20 @@ class MemoryStorage(BaseStorage):
             self._counters.pop(key, None)
 
     def result_store_size(self):
-        return len(self._results)
+        with self._lock:
+            return len(self._results)
 
     def result_items(self):
-        return dict(self._results)
+        with self._lock:
+            return dict(self._results)
 
     def flush_results(self):
-        self._results = {}
+        with self._lock:
+            self._results = {}
 
     def flush_counters(self):
-        self._counters = {}
+        with self._lock:
+            self._counters = {}
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -1086,18 +1109,21 @@ class FileStorage(BaseStorage):
         return data
 
     def queue_size(self):
-        return len(self._get_sorted_filenames(self.queue_path))
+        with self.lock:
+            return len(self._get_sorted_filenames(self.queue_path))
 
     def enqueued_items(self, limit=None):
-        filenames = self._get_sorted_filenames(self.queue_path)[:limit]
-        accum = []
-        for filename in filenames:
-            with open(os.path.join(self.queue_path, filename), 'rb') as fh:
-                accum.append(fh.read())
-        return accum
+        with self.lock:
+            filenames = self._get_sorted_filenames(self.queue_path)[:limit]
+            accum = []
+            for filename in filenames:
+                with open(os.path.join(self.queue_path, filename), 'rb') as fh:
+                    accum.append(fh.read())
+            return accum
 
     def flush_queue(self):
-        self._flush_dir(self.queue_path)
+        with self.lock:
+            self._flush_dir(self.queue_path)
 
     def _timestamp_to_prefix(self, ts):
         ts = time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
@@ -1139,18 +1165,21 @@ class FileStorage(BaseStorage):
         return tasks
 
     def schedule_size(self):
-        return len(self._get_sorted_filenames(self.schedule_path))
+        with self.lock:
+            return len(self._get_sorted_filenames(self.schedule_path))
 
     def scheduled_items(self, limit=None):
-        filenames = self._get_sorted_filenames(self.schedule_path)[:limit]
-        accum = []
-        for filename in filenames:
-            with open(os.path.join(self.schedule_path, filename), 'rb') as fh:
-                accum.append(fh.read())
-        return accum
+        with self.lock:
+            filenames = self._get_sorted_filenames(self.schedule_path)[:limit]
+            accum = []
+            for filename in filenames:
+                with open(os.path.join(self.schedule_path, filename), 'rb') as fh:
+                    accum.append(fh.read())
+            return accum
 
     def flush_schedule(self):
-        self._flush_dir(self.schedule_path)
+        with self.lock:
+            self._flush_dir(self.schedule_path)
 
     def path_for_key(self, key):
         if isinstance(key, str):
@@ -1185,15 +1214,15 @@ class FileStorage(BaseStorage):
         return key, data[4 + key_len:]
 
     def peek_data(self, key):
-        filename = self.path_for_key(key)
-        if not os.path.exists(filename):
-            return EmptyData
+        with self.lock:
+            filename = self.path_for_key(key)
+            if not os.path.exists(filename):
+                return EmptyData
 
-        with open(filename, 'rb') as fh:
-            _, value = self._unpack_result(fh.read())
+            with open(filename, 'rb') as fh:
+                _, value = self._unpack_result(fh.read())
 
-        # If file is corrupt or has been tampered with, return EmptyData.
-        return value if value is not None else EmptyData
+            return value if value is not None else EmptyData
 
     def pop_data(self, key):
         filename = self.path_for_key(key)
@@ -1207,11 +1236,32 @@ class FileStorage(BaseStorage):
 
             os.unlink(filename)
 
-        # If file is corrupt or has been tampered with, return EmptyData.
         return value if value is not None else EmptyData
 
     def has_data_for_key(self, key):
-        return os.path.exists(self.path_for_key(key))
+        with self.lock:
+            return os.path.exists(self.path_for_key(key))
+
+    def put_if_empty(self, key, value):
+        with self.lock:
+            filename = self.path_for_key(key)
+            if os.path.exists(filename):
+                return False
+            
+            if isinstance(key, str):
+                key = key.encode('utf8')
+            
+            dirname = os.path.dirname(filename)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+            
+            with open(filename, 'wb') as fh:
+                key_len = len(key)
+                fh.write(struct.pack('>I', key_len))
+                fh.write(key)
+                fh.write(value)
+            
+            return True
 
     def _counter_filename(self, key):
         if isinstance(key, str):
@@ -1240,21 +1290,29 @@ class FileStorage(BaseStorage):
                 os.unlink(filename)
 
     def result_store_size(self):
-        return sum(len(filenames) for _, _, filenames
-                   in os.walk(self.result_path))
+        with self.lock:
+            if not os.path.exists(self.result_path):
+                return 0
+            return sum(len(filenames) for _, _, filenames
+                       in os.walk(self.result_path))
 
     def result_items(self):
-        accum = {}
-        for root, _, filenames in os.walk(self.result_path):
-            for filename in filenames:
-                path = os.path.join(root, filename)
-                with open(path, 'rb') as fh:
-                    key, value = self._unpack_result(fh.read())
-                accum[key] = value
-        return accum
+        with self.lock:
+            accum = {}
+            if not os.path.exists(self.result_path):
+                return accum
+            for root, _, filenames in os.walk(self.result_path):
+                for filename in filenames:
+                    path = os.path.join(root, filename)
+                    with open(path, 'rb') as fh:
+                        key, value = self._unpack_result(fh.read())
+                    accum[key] = value
+            return accum
 
     def flush_results(self):
-        self._flush_dir(self.result_path)
+        with self.lock:
+            self._flush_dir(self.result_path)
 
     def flush_counters(self):
-        self._flush_dir(self.counter_path)
+        with self.lock:
+            self._flush_dir(self.counter_path)

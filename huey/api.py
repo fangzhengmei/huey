@@ -541,6 +541,14 @@ class Huey(object):
             elif not task.retries:
                 err = Error(self.build_error_result(task, exception))
                 self._check_chord(task, err)
+        elif exception is not None and not task.retries:
+            chord_task = task.on_complete
+            while chord_task is not None:
+                if chord_task.chord_config is not None:
+                    err = Error(self.build_error_result(task, exception))
+                    self._check_chord(chord_task, err)
+                    break
+                chord_task = chord_task.on_complete
 
         if exception is not None and task.retries:
             self._emit(S.SIGNAL_RETRYING, task)

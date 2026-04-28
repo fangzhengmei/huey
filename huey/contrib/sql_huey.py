@@ -1,5 +1,6 @@
 from functools import partial
 import operator
+import threading
 
 from peewee import *
 from playhouse.db_url import connect as db_url_connect
@@ -32,6 +33,8 @@ class SqlStorage(BaseStorage):
 
         self.KV, self.Schedule, self.Task, self.Counter = self.create_models()
         self.create_tables()
+
+        self._lock = threading.RLock()
 
         # Check for FOR UPDATE SKIP LOCKED support.
         if isinstance(self.database, PostgresqlDatabase):
@@ -114,143 +117,159 @@ class SqlStorage(BaseStorage):
             self.database.connect()
 
     def enqueue(self, data, priority=None):
-        self.check_conn()
-        self.Task.create(queue=self.name, data=data, priority=priority or 0)
+        with self._lock:
+            self.check_conn()
+            self.Task.create(queue=self.name, data=data, priority=priority or 0)
 
     def dequeue(self):
-        self.check_conn()
-        query = (self.tasks(self.Task.id, self.Task.data)
-                 .order_by(self.Task.priority.desc(), self.Task.id)
-                 .limit(1))
-        if self.for_update:
-            query = query.for_update(self.for_update)
+        with self._lock:
+            self.check_conn()
+            query = (self.tasks(self.Task.id, self.Task.data)
+                     .order_by(self.Task.priority.desc(), self.Task.id)
+                     .limit(1))
+            if self.for_update:
+                query = query.for_update(self.for_update)
 
-        with self.database.atomic():
-            try:
-                task = query.get()
-            except self.Task.DoesNotExist:
-                return
+            with self.database.atomic():
+                try:
+                    task = query.get()
+                except self.Task.DoesNotExist:
+                    return
 
-            nrows = self.Task.delete().where(self.Task.id == task.id).execute()
-            if nrows == 1:
-                return task.data
+                nrows = self.Task.delete().where(self.Task.id == task.id).execute()
+                if nrows == 1:
+                    return task.data
 
     def queue_size(self):
-        return self.tasks().count()
+        with self._lock:
+            return self.tasks().count()
 
     def enqueued_items(self, limit=None):
-        query = self.tasks(self.Task.data).order_by(self.Task.priority.desc(),
-                                                    self.Task.id)
-        if limit is not None:
-            query = query.limit(limit)
-        return list(map(operator.itemgetter(0), query.tuples()))
+        with self._lock:
+            query = self.tasks(self.Task.data).order_by(self.Task.priority.desc(),
+                                                        self.Task.id)
+            if limit is not None:
+                query = query.limit(limit)
+            return list(map(operator.itemgetter(0), query.tuples()))
 
     def flush_queue(self):
-        self.Task.delete().where(self.Task.queue == self.name).execute()
+        with self._lock:
+            self.Task.delete().where(self.Task.queue == self.name).execute()
 
     def add_to_schedule(self, data, timestamp):
-        self.check_conn()
-        self.Schedule.create(queue=self.name, data=data, timestamp=timestamp)
+        with self._lock:
+            self.check_conn()
+            self.Schedule.create(queue=self.name, data=data, timestamp=timestamp)
 
     def read_schedule(self, timestamp):
-        self.check_conn()
-        query = (self.schedule(self.Schedule.id, self.Schedule.data)
-                 .where(self.Schedule.timestamp <= timestamp)
-                 .tuples())
-        if self.for_update:
-            query = query.for_update(self.for_update)
+        with self._lock:
+            self.check_conn()
+            query = (self.schedule(self.Schedule.id, self.Schedule.data)
+                     .where(self.Schedule.timestamp <= timestamp)
+                     .tuples())
+            if self.for_update:
+                query = query.for_update(self.for_update)
 
-        with self.database.atomic():
-            results = list(query)
-            if not results:
-                return []
+            with self.database.atomic():
+                results = list(query)
+                if not results:
+                    return []
 
-            id_list, data = zip(*results)
-            (self.Schedule
-             .delete()
-             .where(self.Schedule.id.in_(id_list))
-             .execute())
+                id_list, data = zip(*results)
+                (self.Schedule
+                 .delete()
+                 .where(self.Schedule.id.in_(id_list))
+                 .execute())
 
-            return list(data)
+                return list(data)
 
     def schedule_size(self):
-        return self.schedule().count()
+        with self._lock:
+            return self.schedule().count()
 
     def scheduled_items(self, limit=None):
-        tasks = (self.schedule(self.Schedule.data)
-                 .order_by(self.Schedule.timestamp)
-                 .tuples())
-        if limit:
-            tasks = tasks.limit(limit)
-        return list(map(operator.itemgetter(0), tasks))
+        with self._lock:
+            tasks = (self.schedule(self.Schedule.data)
+                     .order_by(self.Schedule.timestamp)
+                     .tuples())
+            if limit:
+                tasks = tasks.limit(limit)
+            return list(map(operator.itemgetter(0), tasks))
 
     def flush_schedule(self):
-        (self.Schedule
-         .delete()
-         .where(self.Schedule.queue == self.name)
-         .execute())
+        with self._lock:
+            (self.Schedule
+             .delete()
+             .where(self.Schedule.queue == self.name)
+             .execute())
 
     def put_data(self, key, value, is_result=False):
-        self.check_conn()
-        if isinstance(self.database, PostgresqlDatabase):
-            (self.KV
-             .insert(queue=self.name, key=key, value=value)
-             .on_conflict(conflict_target=[self.KV.queue, self.KV.key],
-                          preserve=[self.KV.value])
-             .execute())
-        else:
-            self.KV.replace(queue=self.name, key=key, value=value).execute()
+        with self._lock:
+            self.check_conn()
+            if isinstance(self.database, PostgresqlDatabase):
+                (self.KV
+                 .insert(queue=self.name, key=key, value=value)
+                 .on_conflict(conflict_target=[self.KV.queue, self.KV.key],
+                              preserve=[self.KV.value])
+                 .execute())
+            else:
+                self.KV.replace(queue=self.name, key=key, value=value).execute()
 
     def peek_data(self, key):
-        self.check_conn()
-        try:
-            kv = self.kv(self.KV.value).where(self.KV.key == key).get()
-        except self.KV.DoesNotExist:
-            return EmptyData
-        else:
-            return kv.value
-
-    def pop_data(self, key):
-        self.check_conn()
-        query = self.kv().where(self.KV.key == key)
-        if self.for_update:
-            query = query.for_update(self.for_update)
-
-        with self.database.atomic():
+        with self._lock:
+            self.check_conn()
             try:
-                kv = query.get()
+                kv = self.kv(self.KV.value).where(self.KV.key == key).get()
             except self.KV.DoesNotExist:
                 return EmptyData
             else:
-                dq = self.KV.delete().where(
-                    (self.KV.queue == self.name) &
-                    (self.KV.key == key))
-                return kv.value if dq.execute() == 1 else EmptyData
+                return kv.value
+
+    def pop_data(self, key):
+        with self._lock:
+            self.check_conn()
+            query = self.kv().where(self.KV.key == key)
+            if self.for_update:
+                query = query.for_update(self.for_update)
+
+            with self.database.atomic():
+                try:
+                    kv = query.get()
+                except self.KV.DoesNotExist:
+                    return EmptyData
+                else:
+                    dq = self.KV.delete().where(
+                        (self.KV.queue == self.name) &
+                        (self.KV.key == key))
+                    return kv.value if dq.execute() == 1 else EmptyData
 
     def has_data_for_key(self, key):
-        self.check_conn()
-        return self.kv().where(self.KV.key == key).exists()
+        with self._lock:
+            self.check_conn()
+            return self.kv().where(self.KV.key == key).exists()
 
     def put_if_empty(self, key, value):
-        self.check_conn()
-        try:
-            with self.database.atomic():
-                self.KV.insert(queue=self.name, key=key, value=value).execute()
-        except IntegrityError:
-            return False
-        else:
-            return True
+        with self._lock:
+            self.check_conn()
+            try:
+                with self.database.atomic():
+                    self.KV.insert(queue=self.name, key=key, value=value).execute()
+            except IntegrityError:
+                return False
+            else:
+                return True
 
     def incr(self, key, amount=1):
-        with self.database.atomic():
-            if isinstance(self.database, MySQLDatabase):
-                self._incr_mysql(key, amount)
-            else:
-                self._incr(key, amount)
+        with self._lock:
+            with self.database.atomic():
+                if isinstance(self.database, MySQLDatabase):
+                    self._incr_mysql(key, amount)
+                else:
+                    self._incr(key, amount)
 
-            return self.Counter.get(
-                (self.Counter.queue == self.name) &
-                (self.Counter.key == key)).value
+                return self.Counter.get(
+                    (self.Counter.queue == self.name) &
+                    (self.Counter.key == key)).value
 
     def _incr_mysql(self, key, amount=1):
         (self.Counter
@@ -267,23 +286,28 @@ class SqlStorage(BaseStorage):
          .execute())
 
     def delete_counter(self, key):
-        with self.database.atomic():
-            self.Counter.delete().where(
-                (self.Counter.queue == self.name) &
-                (self.Counter.key == key)).execute()
+        with self._lock:
+            with self.database.atomic():
+                self.Counter.delete().where(
+                    (self.Counter.queue == self.name) &
+                    (self.Counter.key == key)).execute()
 
     def result_store_size(self):
-        return self.kv().count()
+        with self._lock:
+            return self.kv().count()
 
     def result_items(self):
-        query = self.kv(self.KV.key, self.KV.value).tuples()
-        return dict((k, v) for k, v in query.iterator())
+        with self._lock:
+            query = self.kv(self.KV.key, self.KV.value).tuples()
+            return dict((k, v) for k, v in query.iterator())
 
     def flush_results(self):
-        self.KV.delete().where(self.KV.queue == self.name).execute()
+        with self._lock:
+            self.KV.delete().where(self.KV.queue == self.name).execute()
 
     def flush_counters(self):
-        self.Counter.delete().where(self.Counter.queue == self.name).execute()
+        with self._lock:
+            self.Counter.delete().where(self.Counter.queue == self.name).execute()
 
 
 SqlHuey = partial(Huey, storage_class=SqlStorage)

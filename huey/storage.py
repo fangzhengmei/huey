@@ -691,6 +691,7 @@ class BaseSqlStorage(BaseStorage):
     def __init__(self, *args, **kwargs):
         super(BaseSqlStorage, self).__init__(*args, **kwargs)
         self._state = _ConnectionLocal()
+        self._lock = threading.RLock()
         self.initialize_schema()
 
     def close(self):
@@ -710,21 +711,22 @@ class BaseSqlStorage(BaseStorage):
 
     @contextlib.contextmanager
     def db(self, commit=False, close=False):
-        conn = self.conn
-        cursor = conn.cursor()
-        try:
-            if commit: cursor.execute(self.begin_sql)
-            yield cursor
-        except Exception:
-            if commit: conn.rollback()
-            raise
-        else:
-            if commit: conn.commit()
-        finally:
-            cursor.close()
-            if close:
-                conn.close()
-                self._state.reset()
+        with self._lock:
+            conn = self.conn
+            cursor = conn.cursor()
+            try:
+                if commit: cursor.execute(self.begin_sql)
+                yield cursor
+            except Exception:
+                if commit: conn.rollback()
+                raise
+            else:
+                if commit: conn.commit()
+            finally:
+                cursor.close()
+                if close:
+                    conn.close()
+                    self._state.reset()
 
     def initialize_schema(self):
         with self.db(commit=True, close=True) as curs:

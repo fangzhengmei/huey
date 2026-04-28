@@ -9,14 +9,15 @@ import unittest
 import uuid
 from queue import Queue
 
-from redis.connection import ConnectionPool
-from redis import Redis
+try:
+    from redis.connection import ConnectionPool
+    from redis import Redis
+except ImportError:
+    ConnectionPool = None
+    Redis = None
 
 from huey.api import Huey
 from huey.api import MemoryHuey
-from huey.api import PriorityRedisHuey
-from huey.api import RedisExpireHuey
-from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import chord
 from huey.constants import EmptyData
@@ -25,10 +26,20 @@ from huey.exceptions import ConfigurationError
 from huey.exceptions import ResultTimeout
 from huey.storage import FileStorage
 from huey.storage import MemoryStorage
-from huey.storage import RedisExpireStorage
 from huey.tests.base import BaseTestCase
 from huey.tests.base import TRAVIS
 from huey.tests.base import slow_test
+
+try:
+    from huey.api import PriorityRedisHuey
+    from huey.api import RedisExpireHuey
+    from huey.api import RedisHuey
+    from huey.storage import RedisExpireStorage
+except ImportError:
+    PriorityRedisHuey = None
+    RedisExpireHuey = None
+    RedisHuey = None
+    RedisExpireStorage = None
 
 
 class StorageTests(object):
@@ -208,6 +219,7 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
         return MemoryHuey(utc=False)
 
 
+@unittest.skipIf(RedisHuey is None, 'redis module not installed')
 class TestRedisStorage(StorageTests, BaseTestCase):
     def get_huey(self):
         return RedisHuey(utc=False)
@@ -223,11 +235,13 @@ class TestRedisStorage(StorageTests, BaseTestCase):
         RedisHuey(host=None, port=None, db=None, url='redis://localhost')
 
 
+@unittest.skipIf(RedisHuey is None, 'redis module not installed')
 class TestRedisStorageWaitResult(TestRedisStorage):
     def get_huey(self):
         return RedisHuey(utc=False, notify_result=True, notify_result_ttl=30)
 
 
+@unittest.skipIf(RedisExpireHuey is None, 'redis module not installed')
 class TestRedisExpireStorage(StorageTests, BaseTestCase):
     # Note that this does not subclass the StorageTests. This is partly because
     # the functionality should already be covered by the TestRedisStorage, as
@@ -304,16 +318,25 @@ class TestRedisExpireStorage(StorageTests, BaseTestCase):
 
 
 def get_redis_version():
-    return int(Redis().info()['redis_version'].split('.', 1)[0])
+    if Redis is None:
+        return 0
+    try:
+        return int(Redis().info()['redis_version'].split('.', 1)[0])
+    except:
+        return 0
 
 
-@unittest.skipIf(get_redis_version() < 5, 'Requires Redis >= 5.0')
+def redis_available():
+    return Redis is not None and get_redis_version() >= 5
+
+
+@unittest.skipIf(not redis_available(), 'Requires Redis >= 5.0')
 class TestPriorityRedisStorage(TestRedisStorage):
     def get_huey(self):
         return PriorityRedisHuey(utc=False)
 
 
-@unittest.skipIf(get_redis_version() < 5, 'Requires Redis >= 5.0')
+@unittest.skipIf(not redis_available(), 'Requires Redis >= 5.0')
 class TestPriorityRedisStorageNotBlocking(TestRedisStorage):
     def get_huey(self):
         return PriorityRedisHuey(utc=False, blocking=False)

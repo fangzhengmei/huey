@@ -1413,6 +1413,29 @@ class TestGroupPrimitive(BaseTestCase):
         with self.assertRaises(TaskException):
             rg.get()
 
+    def test_group_error_access(self):
+        @self.huey.task()
+        def test(n):
+            return n + 1
+
+        g = group([test.s(1), test.s(None), test.s(2)])
+        rg = self.huey.enqueue(g)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(self.execute_next(), 3)
+
+        self.assertEqual(rg[0], 2)
+        with self.assertRaises(TaskException):
+            rg[1]
+        self.assertEqual(rg[2], 3)
+
+        results = list(rg)
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0].get(True), 2)
+        with self.assertRaises(TaskException):
+            results[1].get(True)
+        self.assertEqual(results[2].get(True), 3)
+
     def test_multiple_task_types(self):
         @self.huey.task()
         def t1(n):

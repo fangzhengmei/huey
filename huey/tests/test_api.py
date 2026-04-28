@@ -1571,6 +1571,41 @@ class TestChordPrimitive(BaseTestCase):
             r.results[1]
         self.assertEqual(r.results[2], 3)
 
+    def test_chord_pipeline_middle_error(self):
+        prod, agg = self.funcs()
+
+        @self.huey.task(retries=0)
+        def fail(n):
+            raise ValueError('intentional failure')
+
+        c = chord([
+            prod.s(0).then(prod).then(prod),
+            prod.s(1).then(fail).then(prod),
+            prod.s(2).then(prod).then(prod),
+        ], agg)
+        r = self.huey.enqueue(c)
+
+        self.assertEqual(len(self.huey), 3)
+        self.assertEqual([self.execute_next() for _ in range(3)], [1, 2, 3])
+
+        self.assertEqual(len(self.huey), 3)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(self.execute_next(), 4)
+
+        self.assertEqual(len(self.huey), 2)
+        self.assertEqual(self.execute_next(), 3)
+        self.assertEqual(self.execute_next(), 5)
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), -1)
+        self.assertEqual(len(self.huey), 0)
+
+        self.assertEqual(r.results[0], 3)
+        with self.assertRaises(TaskException):
+            r.results[1]
+        self.assertEqual(r.results[2], 5)
+
     def test_chord_error_cb(self):
         prod, agg = self.funcs()
         state = []

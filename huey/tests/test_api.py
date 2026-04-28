@@ -1826,6 +1826,36 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, [99])
 
+    def test_chord_chaining_member_results_access(self):
+        @self.huey.task()
+        def incr(n):
+            return n + 1
+        @self.huey.task()
+        def agg(ns):
+            return sum(ns)
+        @self.huey.task()
+        def finished(res):
+            return res * 10
+
+        c = chord([incr.s(i) for i in range(3)], agg).then(finished)
+        r = self.huey.enqueue(c)
+        self.assertEqual(len(self.huey), 3)
+        self.assertEqual([self.execute_next() for _ in range(3)], [1, 2, 3])
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), 6)
+
+        self.assertEqual(r.results[0], 1)
+        self.assertEqual(r.results[1], 2)
+        self.assertEqual(r.results[2], 3)
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), 60)
+
+        self.assertEqual(r(), 6)
+        self.assertEqual(r.pipeline_results(), [6, 60])
+        self.assertEqual(r.results(), [1, 2, 3])
+
 
 class TestTaskChaining(BaseTestCase):
     def test_pipeline_tuple(self):

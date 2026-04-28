@@ -369,11 +369,11 @@ class Huey(object):
         pipeline = None
         if chord_obj.callback.on_complete:
             current = chord_obj.callback.on_complete
-            results = [callback_result]
+            pipeline_results = [callback_result]
             while current is not None:
-                results.append(Result(self, current))
+                pipeline_results.append(Result(self, current))
                 current = current.on_complete
-            pipeline = ResultGroup(results)
+            pipeline = ResultGroup(pipeline_results)
 
         return ChordResult(results, callback_result, pipeline)
 

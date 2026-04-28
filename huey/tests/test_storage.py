@@ -218,6 +218,147 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
     def get_huey(self):
         return MemoryHuey(utc=False)
 
+    def test_concurrent_queue_operations(self):
+        nthreads = 10
+        ntasks = 100
+        errors = []
+
+        def worker(tid, result_list):
+            try:
+                for i in range(ntasks):
+                    item = f'thread-{tid}-task-{i}'.encode('utf8')
+                    self.s.enqueue(item)
+            except Exception as e:
+                errors.append((tid, 'enqueue', e))
+
+        def dequeuer(tid, result_list):
+            try:
+                while True:
+                    item = self.s.dequeue()
+                    if item is None:
+                        break
+                    result_list.append(item)
+            except Exception as e:
+                errors.append((tid, 'dequeue', e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i, None))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(self.s.queue_size(), nthreads * ntasks)
+        self.assertEqual(len(errors), 0)
+
+        result_list = []
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=dequeuer, args=(i, result_list))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(len(result_list), nthreads * ntasks)
+        self.assertEqual(len(errors), 0)
+
+    def test_concurrent_result_store(self):
+        nthreads = 10
+        nops = 100
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(nops):
+                    key = f'key-{tid}-{i}'.encode('utf8')
+                    value = f'value-{tid}-{i}'.encode('utf8')
+                    self.s.put_data(key, value)
+                    peeked = self.s.peek_data(key)
+                    self.assertEqual(peeked, value)
+                    popped = self.s.pop_data(key)
+                    self.assertEqual(popped, value)
+            except Exception as e:
+                errors.append((tid, e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(self.s.result_store_size(), 0)
+
+    def test_concurrent_counter(self):
+        nthreads = 10
+        nincr = 100
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(nincr):
+                    self.s.incr('shared-counter')
+            except Exception as e:
+                errors.append((tid, e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(self.s.incr('shared-counter', 0), nthreads * nincr)
+
+    def test_put_if_empty_atomicity(self):
+        nthreads = 10
+        winners = []
+        errors = []
+
+        def worker(tid):
+            try:
+                result = self.s.put_if_empty(b'race-key', f'winner-{tid}'.encode('utf8'))
+                if result:
+                    winners.append(tid)
+            except Exception as e:
+                errors.append((tid, e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(len(winners), 1)
+
+        value = self.s.peek_data(b'race-key')
+        self.assertTrue(value.startswith(b'winner-'))
+
 
 @unittest.skipIf(RedisHuey is None, 'redis module not installed')
 class TestRedisStorage(StorageTests, BaseTestCase):
@@ -448,6 +589,121 @@ class TestFileStorageMethods(StorageTests, BaseTestCase):
         # which they are dequeued.
         for i in range(nthreads * ntasks):
             self.assertEqual(in_q.get(), out_q.get())
+
+    def test_concurrent_queue_operations_no_external_lock(self):
+        nthreads = 5
+        ntasks = 50
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(ntasks):
+                    item = f'thread-{tid}-task-{i}'.encode('utf8')
+                    self.s.enqueue(item)
+            except Exception as e:
+                errors.append((tid, 'enqueue', e))
+
+        def dequeuer(tid, result_list):
+            try:
+                while True:
+                    item = self.s.dequeue()
+                    if item is None:
+                        break
+                    result_list.append(item)
+            except Exception as e:
+                errors.append((tid, 'dequeue', e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(self.s.queue_size(), nthreads * ntasks)
+        self.assertEqual(len(errors), 0)
+
+        result_list = []
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=dequeuer, args=(i, result_list))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(len(result_list), nthreads * ntasks)
+        self.assertEqual(len(errors), 0)
+
+    def test_concurrent_result_store_no_external_lock(self):
+        nthreads = 5
+        nops = 50
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(nops):
+                    key = f'key-{tid}-{i}'.encode('utf8')
+                    value = f'value-{tid}-{i}'.encode('utf8')
+                    self.s.put_data(key, value)
+                    peeked = self.s.peek_data(key)
+                    self.assertEqual(peeked, value)
+                    popped = self.s.pop_data(key)
+                    self.assertEqual(popped, value)
+            except Exception as e:
+                errors.append((tid, e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(self.s.result_store_size(), 0)
+
+    def test_fs_put_if_empty_atomicity(self):
+        nthreads = 5
+        winners = []
+        errors = []
+
+        def worker(tid):
+            try:
+                result = self.s.put_if_empty(b'race-key-fs', f'winner-{tid}'.encode('utf8'))
+                if result:
+                    winners.append(tid)
+            except Exception as e:
+                errors.append((tid, e))
+
+        threads = []
+        for i in range(nthreads):
+            t = threading.Thread(target=worker, args=(i,))
+            t.daemon = True
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.)
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(len(winners), 1)
+
+        value = self.s.peek_data(b'race-key-fs')
+        self.assertTrue(value.startswith(b'winner-'))
 
     @unittest.skipIf(TRAVIS, 'skipping test that is flaky on travis-ci')
     def test_consumer_integration(self):

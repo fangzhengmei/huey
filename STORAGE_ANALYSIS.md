@@ -137,6 +137,9 @@ def incr(self, key, amount=1):
     with self._lock:  # 有锁保护
         self._counters[key] = self._counters.get(key, 0) + amount
     return self._counters[key]
+
+def pop_data(self, key):
+    return self._results.pop(key, EmptyData)  # dict.pop 在 CPython 中是原子的
 ```
 
 ---
@@ -220,17 +223,67 @@ def put_if_empty(self, key, value):
 
 def incr(self, key, amount=1):
     return self.conn.hincrby(self.counter_key, key, amount)  # Redis 原生原子
+```
 
+##### pop_data 的实现与语义分析
+
+```python
 def pop_data(self, key):
     pipe = self.conn.pipeline()
     pipe.hexists(self.result_key, key)
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
-    exists, val, n = pipe.execute()  # Pipeline 但非原子！
+    exists, val, n = pipe.execute()
     return EmptyData if not exists else val
 ```
 
-**注意**: `pop_data` 使用 pipeline 但不是原子事务。如果需要原子性，应该使用 Lua 脚本或 MULTI/EXEC。
+**关键分析**：
+
+1. **Redis 单线程执行模型**：
+   - Redis 使用单线程事件循环处理所有客户端请求
+   - 一个客户端的 pipeline 命令会被**连续执行**，不会被其他客户端的命令打断
+   - 这意味着虽然没有使用 MULTI/EXEC 事务，但实际执行是"批处理原子"的
+
+2. **并发场景分析**：
+   ```
+   Client A 发送: [HEXISTS, HGET, HDEL]
+   Client B 发送: [HEXISTS, HGET, HDEL]
+   
+   Redis 执行顺序（取决于网络调度）：
+   要么：
+     1. A 的 HEXISTS → 1
+     2. A 的 HGET → value
+     3. A 的 HDEL → 1 (key 被删除)
+     4. B 的 HEXISTS → 0 (key 已不存在)
+     5. B 的 HGET → nil
+     6. B 的 HDEL → 0
+   结果：A 拿到 value，B 拿到 EmptyData
+   
+   要么：
+     1. B 的 HEXISTS → 1
+     ... (类似)
+   结果：B 拿到 value，A 拿到 EmptyData
+   ```
+
+3. **实际结论**：
+   - **不会出现两个客户端都拿到值的情况**
+   - 但代码忽略了 `hdel` 的返回值 `n`，只检查了 `exists`
+   - 这在正常场景下是安全的，但在极端场景（如 key 在 HEXISTS 和 HGET 之间过期）可能有问题
+
+##### RedisExpireStorage 的特殊设计
+
+```python
+# Here we explicitly prevent result items from being removed by using the
+# same implementation for "pop" (get and delete) as we do for "peek"
+# (non-destructive read).
+pop_data = peek_data
+```
+
+**重要发现**：
+- `RedisExpireStorage` **明确选择不做破坏性读取**
+- `pop_data` 被重定义为 `peek_data` 的别名
+- 数据的删除完全依赖 Redis 的 TTL 自动过期机制
+- 这是设计者对并发问题的**明确应对策略**
 
 ---
 
@@ -346,403 +399,280 @@ def dequeue(self):
 - 整个操作在 `BEGIN EXCLUSIVE` 事务中
 - `rowcount == 1` 检查确保确实删除了一行
 
-##### 调度操作
+##### pop_data 实现
 
 ```python
-def read_schedule(self, ts):
-    with self.db(commit=True) as curs:
-        params = (self.name, ts.timestamp())
-        # 1. 查询所有到期任务
-        curs.execute('select id, data from schedule where '
-                     'queue = ? and timestamp <= ?', params)
-        id_list, data = [], []
-        for task_id, task_data in curs.fetchall():
-            id_list.append(task_id)
-            data.append(task_data)
-        # 2. 批量删除
-        if id_list:
-            plist = ','.join('?' * len(id_list))
-            curs.execute('delete from schedule where id IN (%s)' % plist,
-                         id_list)
-        return data
-```
-
-##### 原子操作实现
-
-```python
-def put_if_empty(self, key, value):
-    try:
-        with self.db(commit=True) as curs:
-            curs.execute('insert or abort into kv '  # 冲突则回滚
-                         '(queue, key, value) values (?, ?, ?)',
-                         (self.name, key, self.to_blob(value)))
-    except sqlite3.IntegrityError:
-        return False
-    else:
-        return True
-
-def incr(self, key, amount=1):
+def pop_data(self, key):
     with self.db(commit=True) as curs:
         if sqlite3.sqlite_version_info >= (3, 35, 0):
             # SQLite 3.35+ 支持 RETURNING 子句
-            curs.execute('insert into counter (queue, key, value) '
-                         'values (?, ?, ?) on conflict (queue, key) '
-                         'do update set value = value + ? '
-                         'returning value',
-                         (self.name, key, amount, amount))
-            value, = curs.fetchone()
-        elif sqlite3.sqlite_version_info >= (3, 24, 0):
-            # SQLite 3.24+ 支持 UPSERT 但无 RETURNING
-            curs.execute('insert into counter (queue, key, value) '
-                         'values (?, ?, ?) on conflict (queue, key) '
-                         'do update set value = value + ?',
-                         (self.name, key, amount, amount))
-            curs.execute('select value from counter where queue = ? and key = ?',
-                         (self.name, key))
-            value, = curs.fetchone()
+            curs.execute('delete from kv where queue = ? and key = ? '
+                         'returning value', (self.name, key))
+            result = curs.fetchone()
+            if result is not None:
+                return result[0]
         else:
-            raise NotImplementedError('SQLite 3.24 or newer is required.')
-    return value
+            # 旧版本：先 SELECT，再 DELETE，检查 rowcount
+            curs.execute('select value from kv where queue = ? and key = ?',
+                         (self.name, key))
+            result = curs.fetchone()
+            if result is not None:
+                curs.execute('delete from kv where queue=? and key=?',
+                             (self.name, key))
+                if curs.rowcount == 1:
+                    return result[0]
+        return EmptyData
 ```
+
+**原子性保证**：
+- SQLite 3.35+: `DELETE ... RETURNING` 是单条 SQL 语句，原子操作
+- 旧版本: 整个操作在 `BEGIN EXCLUSIVE` 事务中，且有 `rowcount` 检查
+- 双重保护：`threading.Lock()` + `BEGIN EXCLUSIVE`
 
 ---
 
-## 三、原子性与并发处理对比
+## 三、pop_data 的实际调用场景分析
 
-### 3.1 原子性保证对比
+### 3.1 Result 类的缓存机制
 
-| 操作类型 | MemoryStorage | RedisStorage | SqliteStorage |
-|----------|---------------|--------------|---------------|
-| **dequeue** | ❌ 无锁保护，heapq 操作非原子 | ✅ Redis 命令原生原子 | ✅ 事务 + rowcount 验证 |
-| **read_schedule** | ✅ 有锁保护 | ✅ Lua 脚本原子执行 | ✅ 事务保护 |
-| **put_if_empty** | ❌ 先检查后写入，非原子 | ✅ HSETNX 原生原子 | ✅ INSERT OR ABORT + IntegrityError |
-| **incr** | ✅ 有锁保护 | ✅ HINCRBY 原生原子 | ✅ UPSERT 原子 |
-| **pop_data** | ⚠️ dict.pop 是原子的 | ⚠️ Pipeline 非原子 | ✅ 事务保护（3.35+ 用 RETURNING） |
-
-### 3.2 并发处理机制
-
-#### MemoryStorage
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                     进程内多线程                          │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐                │
-│  │ Thread1 │  │ Thread2 │  │ Thread3 │                │
-│  └────┬────┘  └────┬────┘  └────┬────┘                │
-│       │            │            │                        │
-│       ▼            ▼            ▼                        │
-│  ┌──────────────────────────────────────┐               │
-│  │    threading.RLock() [部分使用]       │               │
-│  │  - enqueue: 有锁                       │               │
-│  │  - dequeue: 无锁 ⚠️                    │               │
-│  │  - incr: 有锁                          │               │
-│  └──────────────────────────────────────┘               │
-│                          │                               │
-│                          ▼                               │
-│  ┌──────────────────────────────────────┐               │
-│  │  Python 原生数据结构（非共享内存）      │               │
-│  │  - heapq 堆                            │               │
-│  │  - dict 字典                           │               │
-│  └──────────────────────────────────────┘               │
-└─────────────────────────────────────────────────────────┘
-                        不支持多进程
-```
-
-**问题**: `dequeue()` 方法没有使用锁：
+**文件位置**: `api.py:1214-1225`
 
 ```python
-def dequeue(self):
-    try:
-        _, _, data = heapq.heappop(self._queue)  # 多线程同时调用会崩溃！
-    except IndexError:
-        pass
+def _get(self, preserve=False):
+    task_id = self.id
+    if self._result is EmptyData:  # 本地缓存检查
+        res = self.huey.get_raw(task_id, peek=preserve)
+        if res is not EmptyData:
+            self._result = self.huey.serializer.deserialize(res)
+            return self._result
+        else:
+            return res
     else:
-        return data
+        return self._result  # 直接返回缓存
 ```
 
-`heapq.heappop` 包含多个操作：
-1. 取出堆顶元素
-2. 将最后一个元素移到堆顶
-3. 执行下沉操作维护堆性质
+**关键发现**：
+1. `Result` 对象有本地缓存 `_result`
+2. 同一个 `Result` 对象多次调用 `get()` 只会调用一次 `pop_data`
+3. 这大大减少了并发冲突的可能性
 
-多线程同时执行时，堆结构可能被破坏。
+### 3.2 pop_data 的实际使用场景
 
-#### RedisStorage
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Redis 服务器（单线程）                      │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    命令队列（串行执行）                     │   │
-│  │  Cmd1 → Cmd2 → Cmd3 → Lua Script → Cmd4 → ...          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                   │
-│                              ▼                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
-│  │  List 队列   │  │ Sorted Set  │  │  Hash 哈希表         │   │
-│  │  (lpush/rpop)│  │ (zadd/zpop) │  │ (hset/hget/hincrby) │   │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-          ▲                    ▲                    ▲
-          │                    │                    │
-    ┌─────┴─────┐        ┌─────┴─────┐        ┌─────┴─────┐
-    │  Client1  │        │  Client2  │        │  Client3  │
-    │ (进程/线程)│        │ (进程/线程)│        │ (进程/线程)│
-    └───────────┘        └───────────┘        └───────────┘
-```
-
-**优势**:
-- 所有命令在 Redis 服务器中单线程串行执行
-- Lua 脚本可以包含多个命令，原子执行
-- 支持多进程、多客户端并发
-
-#### SqliteStorage
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    应用层 (Python 进程)                           │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐                  │
-│  │  Thread1  │  │  Thread2  │  │  Thread3  │                  │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘                  │
-│        │              │              │                          │
-│        ▼              ▼              ▼                          │
-│  ┌───────────────────────────────────────┐                     │
-│  │      threading.Lock() [同一进程内]      │                     │
-│  │      确保同一时间只有一个线程操作数据库    │                     │
-│  └───────────────────────────────────────┘                     │
-│                              │                                   │
-│                              ▼                                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              SQLite 数据库连接                           │   │
-│  │  ┌─────────────────────────────────────────────────┐    │   │
-│  │  │  BEGIN EXCLUSIVE 事务                            │    │   │
-│  │  │  - 阻止其他连接写入                               │    │   │
-│  │  │  - 允许其他连接读取（取决于锁级别）                │    │   │
-│  │  └─────────────────────────────────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │  SQLite 数据库文件 │
-                    │  (可被多进程访问)  │
-                    └─────────────────┘
-```
-
-**双重锁机制**:
-1. `threading.Lock()` - 防止同一进程内多线程竞争
-2. `BEGIN EXCLUSIVE` - SQLite 级别的排他锁，防止其他进程写入
-
-**WAL 模式配置**:
+#### 场景 1：任务结果获取
 
 ```python
-def _create_connection(self):
-    conn = sqlite3.connect(self.filename, timeout=self._timeout,
-                           check_same_thread=False,
-                           **self._conn_kwargs)
-    conn.isolation_level = None  # 自动提交模式
-    conn.execute('pragma journal_mode="%s"' % self._journal_mode)  # 默认 WAL
-    if self._cache_mb:
-        conn.execute('pragma cache_size=%s' % (-1000 * self._cache_mb))
-    conn.execute('pragma synchronous=%s' % (2 if self._fsync else 0))
-    return conn
+# 用户代码
+result = my_task(1, 2)
+print(result.get())  # 第一次调用：调用 pop_data
+print(result.get())  # 第二次调用：直接返回缓存，不调用 pop_data
 ```
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `journal_mode` | `wal` | Write-Ahead Logging，支持更高并发 |
-| `synchronous` | `0` (OFF) | 不等待 fsync，性能高但崩溃可能丢数据 |
-| `timeout` | `5` 秒 | 锁等待超时时间 |
+**并发风险**：
+- 同一个 `Result` 对象：无风险（缓存保护）
+- 多个独立的 `Result` 对象（或多个进程）同时获取同一个任务：理论上有风险，但实际场景少见
+
+#### 场景 2：撤销键清理
+
+**文件位置**: `api.py:505-506`
+
+```python
+# Clear the flag if this instance of the task was revoked after it
+# began executing by destructively reading it's revoke key.
+if not isinstance(task, PeriodicTask):
+    self.get(task.revoke_id)  # peek=False，调用 pop_data
+```
+
+**并发风险**：
+- 每个任务只被**一个消费者**执行
+- 所以这里的 `pop_data` 调用不会有并发冲突
+
+#### 场景 3：Chord 结果收集
+
+**文件位置**: `api.py:543-560`
+
+```python
+def _check_chord(self, task, value):
+    cc = task.chord_config
+    chord_key = 'chord:%s' % cc.cid
+    result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
+    self.put_result(result_key, value)
+    
+    if self.storage.incr(chord_key) == cc.size:  # 原子操作
+        self.storage.delete_counter(chord_key)
+        
+        results = []
+        for idx in range(cc.size):
+            result = self.get('chord:%s:%s' % (cc.cid, idx))  # 调用 pop_data
+            results.append(result)
+        # ... 执行回调
+```
+
+**并发风险**：
+- `incr()` 是原子操作
+- 只有**最后一个**完成的任务会进入 `if` 块
+- 所以这里的 `pop_data` 调用只会由一个线程执行，**无并发风险**
+
+#### 场景 4：撤销状态检查
+
+**文件位置**: `api.py:645-669`
+
+```python
+def _check_revoked(self, revoke_id, timestamp=None, peek=True):
+    res = self.get(revoke_id, peek=True)  # 默认 peek=True，调用 peek_data
+    if res is None:
+        return False, False
+    # ...
+    if revoke_once:
+        return True, not peek  # 如果 peek=False，需要恢复
+    # ...
+```
+
+**关键发现**：
+- 默认使用 `peek=True`，调用 `peek_data` 而非 `pop_data`
+- 只有当 `can_restore` 时才会调用 `restore` → `delete_data`
+- 这里的并发风险很低
+
+### 3.3 实际并发风险总结
+
+| 使用场景 | 调用者 | 并发风险 | 保护机制 |
+|----------|--------|----------|----------|
+| 任务结果获取 (同一个 Result) | 用户代码 | **无** | 本地缓存 `_result` |
+| 任务结果获取 (多个独立 Result) | 用户代码 | 低 | 实际场景少见 |
+| 撤销键清理 | `_execute` | **无** | 单消费者执行 |
+| Chord 结果收集 | `_check_chord` | **无** | `incr` 原子性保证 |
+| 撤销状态检查 | `_check_revoked` | **无** | 默认使用 `peek=True` |
+
+**核心结论**：
+- `pop_data` 的实际并发风险**非常低**
+- 大多数场景要么有保护机制，要么天然单线程执行
+- 唯一可能的风险场景是"多个独立的客户端/进程同时获取同一个任务的结果"
 
 ---
 
-## 四、任务可靠性分析
+## 四、原子性与并发处理对比（修正版）
 
-### 4.1 崩溃场景对比
+### 4.1 pop_data 原子性重新评估
 
-#### MemoryStorage - 最不可靠
-
-```
-崩溃场景分析：
-
-正常运行状态：
-┌─────────────────────────────────────────┐
-│           Python 进程内存                 │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │ 队列    │ │ 调度表  │ │ 结果    │   │
-│  │ (heapq) │ │ (heapq) │ │ (dict)  │   │
-│  └─────────┘ └─────────┘ └─────────┘   │
-└─────────────────────────────────────────┘
-
-崩溃后：
-┌─────────────────────────────────────────┐
-│           进程已终止，内存已释放          │
-│  ┌─────────────────────────────────┐    │
-│  │  所有数据完全丢失！无法恢复       │    │
-│  └─────────────────────────────────┘    │
-└─────────────────────────────────────────┘
-```
-
-**风险评估**:
-- **进程崩溃**: 100% 数据丢失
-- **机器重启**: 100% 数据丢失
-- **恢复能力**: 无
-- **适用场景**: 开发测试、临时任务、可重复执行的任务
-
-#### RedisStorage - 取决于持久化配置
-
-```
-持久化策略对比：
-
-┌────────────────────────────────────────────────────────────┐
-│                      RDB 快照模式                            │
-│  时机：定期执行（如 save 900 1）                            │
-│                                                             │
-│  T0: save 完成 → 数据安全                                    │
-│  T1: 新任务入队 → 仅在内存 ⚠️                               │
-│  T2: 进程崩溃 → T1 的任务丢失！                              │
-│  T3: Redis 重启 → 从 T0 的 RDB 恢复                         │
-└────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────┐
-│                      AOF 追加模式                            │
-│  appendfsync 选项：                                          │
-│  - always: 每个命令都 fsync → 最安全，性能最低              │
-│  - everysec: 每秒 fsync → 平衡，可能丢 1 秒数据            │
-│  - no: 由 OS 决定何时刷盘 → 性能最高，可能丢更多数据        │
-└────────────────────────────────────────────────────────────┘
-```
-
-**风险评估**:
-
-| 配置 | 崩溃后数据丢失 | 恢复能力 |
-|------|---------------|---------|
-| RDB 默认 | 可能丢数分钟数据 | 从 RDB 文件恢复 |
-| AOF + appendfsync=always | 几乎不丢 | 从 AOF 文件重放 |
-| AOF + appendfsync=everysec | 可能丢 1 秒 | 从 AOF 文件重放 |
-| 无持久化 | 100% 丢失 | 无法恢复 |
-
-**主从复制额外风险**:
-- 异步复制：主节点崩溃时，从节点可能尚未同步最新数据
-- 故障转移可能导致数据丢失
-
-#### SqliteStorage - 取决于同步配置
-
-```
-synchronous 配置对比：
-
-┌────────────────────────────────────────────────────────────┐
-│  synchronous = 0 (OFF) - 默认值                            │
-│                                                             │
-│  应用写入 → OS 页缓存 → [不确定何时] → 磁盘                │
-│                       ↑                                     │
-│              崩溃则丢失这部分数据 ⚠️                        │
-│                                                             │
-│  风险：OS 崩溃或机器掉电可能丢失数据                        │
-└────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────┐
-│  synchronous = 2 (FULL) - 最安全                           │
-│                                                             │
-│  应用写入 → OS 页缓存 → 立即 fsync → 磁盘                  │
-│                                          │                  │
-│                                    写入完成确认              │
-│                                                             │
-│  风险：几乎无数据丢失风险，但性能降低                       │
-└────────────────────────────────────────────────────────────┘
-```
-
-**WAL 模式恢复机制**:
-- WAL 文件在 checkpoint 之前包含所有变更
-- 崩溃后重启时，SQLite 会自动检查并重放 WAL
-- 只要 `synchronous=FULL`，数据在提交时已落盘
-
-### 4.2 并发写场景分析
-
-#### MemoryStorage - 存在竞态
+#### MemoryStorage.pop_data
 
 ```python
-# 问题代码：dequeue 无锁
-def dequeue(self):
-    try:
-        # heapq.heappop 不是线程安全的！
-        _, _, data = heapq.heappop(self._queue)
-    except IndexError:
-        pass
-    else:
-        return data
+def pop_data(self, key):
+    return self._results.pop(key, EmptyData)
 ```
 
-**竞态场景**:
+**分析**：
+- `dict.pop(key, default)` 在 CPython 中是**原子操作**（GIL 保护）
+- 但只适用于**单进程内**的多线程
+- 多进程场景不适用（MemoryStorage 不支持多进程）
 
-```
-时间线：
-Thread1: 检查堆非空 → 取出堆顶元素 (index=0)
-Thread2: 同时也在执行 heappop → 可能读取到不一致的状态
-Thread1: 移动最后一个元素到堆顶，开始下沉
-Thread2: 堆结构已被破坏，可能引发 IndexError 或数据错乱
+**结论**：✅ 对于它的使用场景（单进程）是原子的
 
-可能的后果：
-1. 同一任务被多个线程获取（重复执行）
-2. 堆结构破坏，某些任务永远无法被取出
-3. Python 异常崩溃
-```
-
-#### RedisStorage - 天然安全
-
-```
-Redis 单线程模型：
-
-Client1: LPUSH queue task1
-Client2: LPUSH queue task2
-Client1: BRPOP queue 0
-Client2: BRPOP queue 0
-
-执行顺序（Redis 内部串行化）：
-1. Client1 LPUSH → queue: [task1]
-2. Client2 LPUSH → queue: [task2, task1]
-3. Client1 BRPOP → 获取 task1，queue: [task2]
-4. Client2 BRPOP → 获取 task2，queue: []
-
-结果：
-- 每个任务只被一个客户端获取
-- 无竞态，无重复，无丢失
-```
-
-#### SqliteStorage - 双重保护
+#### RedisStorage.pop_data
 
 ```python
-def dequeue(self):
-    with self.db(commit=True) as curs:  # 1. 获取 threading.Lock()
-        # 2. BEGIN EXCLUSIVE 事务
-        curs.execute('select id, data from task where queue = ? '
-                     'order by priority desc, id limit 1', (self.name,))
-        result = curs.fetchone()
-        if result is not None:
-            tid, data = result
-            curs.execute('delete from task where id = ?', (tid,))
-            # 3. 验证删除成功
-            if curs.rowcount == 1:
-                return data
+def pop_data(self, key):
+    pipe = self.conn.pipeline()
+    pipe.hexists(self.result_key, key)
+    pipe.hget(self.result_key, key)
+    pipe.hdel(self.result_key, key)
+    exists, val, n = pipe.execute()
+    return EmptyData if not exists else val
 ```
 
-**多进程场景**:
+**分析**：
+- 不是 MULTI/EXEC 事务
+- 但 Redis 单线程模型保证 pipeline 中的命令**连续执行**
+- **不会出现两个客户端都拿到值的情况**
+- 但代码忽略了 `hdel` 的返回值 `n`，只检查了 `exists`
+- 在极端场景（如 key 过期）可能有问题
 
+**结论**：✅ 实际场景下是并发安全的（虽然不是严格的"原子事务"）
+
+#### RedisExpireStorage.pop_data
+
+```python
+pop_data = peek_data  # 明确不做删除！
 ```
-进程 A: BEGIN EXCLUSIVE → 获取数据库写锁
-进程 B: BEGIN EXCLUSIVE → 等待锁 (busy)
-进程 A: SELECT → 获取任务 X
-进程 A: DELETE 任务 X → rowcount = 1
-进程 A: COMMIT → 释放锁
-进程 B: 获取锁 → BEGIN EXCLUSIVE
-进程 B: SELECT → 获取任务 Y (X 已被删除)
-进程 B: DELETE 任务 Y
-进程 B: COMMIT
+
+**分析**：
+- 这是最安全的实现
+- 完全避免了"读取并删除"的并发问题
+- 依赖 Redis TTL 自动过期
+
+**结论**：✅ 完全没有并发问题（设计上选择不做删除）
+
+#### SqliteStorage.pop_data
+
+```python
+def pop_data(self, key):
+    with self.db(commit=True) as curs:  # 双重锁保护
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            curs.execute('delete ... returning value', ...)  # 原子
+        else:
+            curs.execute('select ...')
+            curs.execute('delete ...')
+            if curs.rowcount == 1:  # 验证
+                return result[0]
 ```
 
-### 4.3 极端场景应对策略
+**分析**：
+- SQLite 3.35+: `DELETE ... RETURNING` 原子操作
+- 旧版本: 事务 + `rowcount` 检查
+- 双重保护：`threading.Lock()` + `BEGIN EXCLUSIVE`
 
-#### 场景 1：消费者崩溃，任务正在执行中
+**结论**：✅ 完全原子的
+
+### 4.2 原子性保证对比表（修正版）
+
+| 操作类型 | MemoryStorage | RedisStorage | RedisExpireStorage | SqliteStorage |
+|----------|---------------|--------------|-------------------|---------------|
+| **dequeue** | ❌ 无锁保护 | ✅ 原生原子 | ✅ 原生原子 | ✅ 事务+rowcount |
+| **read_schedule** | ✅ 有锁保护 | ✅ Lua 脚本 | ✅ Lua 脚本 | ✅ 事务保护 |
+| **put_if_empty** | ❌ 先检查后写入 | ✅ HSETNX | ✅ SETNX | ✅ INSERT OR ABORT |
+| **incr** | ✅ 有锁保护 | ✅ HINCRBY | ✅ INCR | ✅ UPSERT |
+| **pop_data** | ✅ dict.pop 原子 | ⚠️ 实际安全但非事务 | ✅ 无删除操作 | ✅ 事务保护 |
+
+### 4.3 关键差异说明
+
+#### RedisStorage vs RedisExpireStorage
+
+| 维度 | RedisStorage | RedisExpireStorage |
+|------|--------------|-------------------|
+| pop_data 语义 | 读取并删除 | 仅读取（不删除） |
+| 结果清理方式 | 显式删除 | 依赖 TTL 自动过期 |
+| 并发风险 | 极低（实际安全） | 无（设计上避免） |
+| 适用场景 | 默认场景 | 需要结果可重复读取 |
+
+#### 设计意图分析
+
+`RedisExpireStorage.pop_data = peek_data` 这个设计揭示了：
+
+1. **设计者意识到了并发问题**：选择不做破坏性读取是对并发风险的明确应对
+2. **"读取并删除"语义本身有争议**：
+   - 如果结果只能被消费一次，那"谁能消费到"变成了竞态
+   - 如果结果可以被多次读取，就不需要破坏性读取
+3. **Huey 的 Result 缓存机制已经缓解了这个问题**：同一个对象多次调用不会重复读取
+
+---
+
+## 五、并发与崩溃场景风险对比（修正版）
+
+### 5.1 并发写场景重新评估
+
+#### 场景 1：多个客户端同时获取同一个任务结果
+
+**各后端表现**：
+
+| 后端 | 实际行为 | 风险等级 |
+|------|----------|----------|
+| MemoryStorage | `dict.pop` 原子，只有一个线程能拿到 | ✅ 安全 |
+| RedisStorage | Pipeline 连续执行，只有一个客户端能拿到 | ✅ 实际安全 |
+| RedisExpireStorage | 不做删除，所有客户端都能拿到 | ✅ 设计如此 |
+| SqliteStorage | 事务保护，只有一个连接能拿到 | ✅ 安全 |
+
+**关键修正**：之前错误地认为 RedisStorage 有竞态风险，实际上 Redis 单线程模型保证了 pipeline 命令的连续执行。
+
+#### 场景 2：消费者崩溃，任务正在执行中
 
 ```
 任务执行流程：
@@ -756,7 +686,7 @@ def dequeue(self):
 - 任务结果未写入
 ```
 
-**各后端表现**:
+**各后端表现**（无变化）：
 
 | 后端 | 任务状态 | 能否自动恢复 |
 |------|---------|-------------|
@@ -769,30 +699,9 @@ def dequeue(self):
 - 任务出队后即从队列删除
 - 依赖重试机制（retries 参数）而非事务性出队
 
-**注意**: 某些消息队列（如 RabbitMQ）采用"确认模式"，任务出队后不立即删除，等待消费者 ack。Huey 没有采用这种设计。
+#### 场景 3：高并发入队
 
-#### 场景 2：高并发入队
-
-```python
-# 1000 个线程同时入队 10000 个任务
-
-# MemoryStorage
-def enqueue(self, data, priority=None):
-    with self._lock:  # 锁竞争成为瓶颈
-        self._c += 1
-        priority = 0 if priority is None else -priority
-        heapq.heappush(self._queue, (priority, self._c, data))
-
-# RedisStorage
-def enqueue(self, data, priority=None):
-    self.conn.lpush(self.queue_key, data)  # 无锁，Redis 处理并发
-
-# SqliteStorage
-def enqueue(self, data, priority=None):
-    self.sql('insert into task ...', commit=True)  # 锁竞争 + 事务开销
-```
-
-**性能对比（估算）**:
+**性能对比**（无变化）：
 
 | 后端 | 单线程入队 (qps) | 100 线程入队 (qps) | 瓶颈 |
 |------|------------------|-------------------|------|
@@ -800,150 +709,77 @@ def enqueue(self, data, priority=None):
 | RedisStorage | 高 (~10k) | 中高 (~5k) | 网络 + Redis 单线程 |
 | SqliteStorage | 中 (~1k) | 低 (~100) | 锁竞争 + 磁盘 IO |
 
-#### 场景 3：批量任务同时到期
+### 5.2 崩溃场景重新评估
 
-```python
-# read_schedule 的原子性保证
+#### 崩溃场景对比表
 
-# Redis - Lua 脚本
-SCHEDULE_POP_LUA = """
-local unix_ts = tonumber(ARGV[1])
-local res = redis.call('zrangebyscore', KEYS[1], '-inf', unix_ts)
-if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res then
-    return res
-end"""
+| 场景 | MemoryStorage | RedisStorage | RedisExpireStorage | SqliteStorage |
+|------|---------------|--------------|-------------------|---------------|
+| **进程崩溃** | 100% 数据丢失 | 取决于持久化 | 取决于持久化 | 取决于 synchronous |
+| **机器重启** | 100% 数据丢失 | 取决于持久化 | 取决于持久化 | 取决于 synchronous |
+| **Redis 主从切换** | 不适用 | 可能丢数据（异步复制） | 可能丢数据 | 不适用 |
+| **SQLite 锁超时** | 不适用 | 不适用 | 不适用 | 可能引发异常 |
 
-# 两个消费者同时调用 read_schedule(now)：
-# Consumer A: 执行 Lua 脚本 → 获取 [task1, task2, task3] → 删除这三个
-# Consumer B: 执行 Lua 脚本 → 集合已空 → 返回 []
-# 结果：无重复，无丢失
+#### Redis 持久化配置影响
 
-# Sqlite - 事务
-def read_schedule(self, ts):
-    with self.db(commit=True) as curs:
-        # BEGIN EXCLUSIVE 确保只有一个连接能执行
-        curs.execute('select id, data from schedule where ...')
-        # ... 处理 ...
-        curs.execute('delete from schedule where id IN (...)')
-```
+| 配置 | 崩溃后数据丢失 | 恢复能力 |
+|------|---------------|---------|
+| RDB 默认 | 可能丢数分钟数据 | 从 RDB 文件恢复 |
+| AOF + appendfsync=always | 几乎不丢 | 从 AOF 文件重放 |
+| AOF + appendfsync=everysec | 可能丢 1 秒 | 从 AOF 文件重放 |
+| 无持久化 | 100% 丢失 | 无法恢复 |
 
-#### 场景 4：任务重复执行检测
+#### SQLite 同步配置影响
 
-```python
-# put_if_empty 的使用场景 - 分布式锁
+| 配置 | 崩溃后数据丢失 | 性能影响 |
+|------|---------------|---------|
+| synchronous=0 (默认) | OS 崩溃可能丢数据 | 最佳性能 |
+| synchronous=1 (NORMAL) | 可能丢少量数据 | 中等性能 |
+| synchronous=2 (FULL) | 几乎不丢 | 性能降低 |
 
-class TaskLock(object):
-    def acquire(self):
-        # 原子性：仅当锁不存在时获取
-        if not self._huey.put_if_empty(self._key, '1'):
-            raise TaskLockedException('unable to acquire lock %s' % self._name)
-        return True
-```
+### 5.3 极端场景应对策略
 
-**各后端 put_if_empty 实现对比**:
+#### 场景 1："读取并删除"的语义问题
 
-| 后端 | 实现方式 | 原子性 | 多进程安全 |
-|------|---------|--------|-----------|
-| MemoryStorage | `if not has_data_for_key(key): put_data(key, value)` | ❌ 非原子 | ❌ 不适用 |
-| RedisStorage | `HSETNX` (Redis 原生命令) | ✅ 原子 | ✅ 安全 |
-| SqliteStorage | `INSERT OR ABORT` + 捕获 `IntegrityError` | ✅ 原子 | ✅ 安全 |
+**问题本质**：
+- `pop_data` 的"读取并删除"语义隐含了"结果只能被消费一次"
+- 但在实际场景中，可能需要：
+  - 结果被多个等待者获取
+  - 结果被缓存后再次访问
 
----
+**Huey 的解决方案**：
 
-## 五、后端选择建议
+1. **Result 本地缓存**：同一个对象多次调用 `get()` 不会重复读取
+2. **preserve 参数**：`result.get(preserve=True)` 使用 `peek_data` 而非 `pop_data`
+3. **RedisExpireStorage**：设计上选择不做删除，依赖 TTL 过期
 
-### 5.1 决策树
+#### 场景 2：消费者崩溃后的任务丢失
 
-```
-                    开始
-                      │
-                      ▼
-           ┌──────────────────────┐
-           │   需要持久化存储吗？   │
-           └──────────────────────┘
-              │              │
-             否              是
-              │              │
-              ▼              ▼
-    ┌────────────────┐ ┌────────────────────┐
-    │  MemoryStorage │ │   需要多进程吗？    │
-    │  (开发测试)    │ └────────────────────┘
-    └────────────────┘    │            │
-                         否            是
-                          │            │
-                          ▼            ▼
-                ┌──────────────┐ ┌──────────────────┐
-                │ SqliteStorage│ │   Redis 可用？    │
-                │ (单进程生产)  │ └──────────────────┘
-                └──────────────┘    │          │
-                                   否          是
-                                    │          │
-                                    ▼          ▼
-                            ┌──────────┐ ┌─────────────┐
-                            │Sqlite或  │ │ RedisStorage│
-                            │考虑其他  │ │ (多进程生产) │
-                            │方案      │ └─────────────┘
-                            └──────────┘
-```
+**问题**：任务出队后消费者崩溃，任务永远丢失
 
-### 5.2 详细对比表
+**现有保护机制**：
+- `retries` 参数：任务失败（包括崩溃？）后重试
+- 但注意：Huey 的重试是针对**执行异常**，不是针对**消费者崩溃**
 
-| 维度 | MemoryStorage | RedisStorage | SqliteStorage |
-|------|---------------|--------------|---------------|
-| **持久化** | ❌ 无 | ✅ 可配置 (RDB/AOF) | ✅ 天然持久化 |
-| **多进程** | ❌ 不支持 | ✅ 完美支持 | ⚠️ 支持但有锁竞争 |
-| **原子性** | ⚠️ 部分操作有缺陷 | ✅ 原生原子 | ✅ 事务保证 |
-| **并发性能** | ⚠️ 锁竞争瓶颈 | ✅ 优秀 | ⚠️ 一般 |
-| **崩溃恢复** | ❌ 无法恢复 | ⚠️ 取决于配置 | ⚠️ 取决于 synchronous |
-| **部署复杂度** | ✅ 零依赖 | ⚠️ 需维护 Redis 实例 | ✅ 零依赖（文件） |
-| **适用场景** | 开发测试 | 高并发生产环境 | 中小规模单进程 |
+**局限性**：
+- 如果消费者在 `dequeue()` 之后、执行之前崩溃，任务丢失
+- 如果消费者在执行过程中崩溃，任务丢失（除非使用 `retries` 且异常被捕获）
 
-### 5.3 配置最佳实践
+**可能的改进方向**（参考其他消息队列）：
+- 使用"确认模式"：任务出队后不立即删除，等待消费者 ack
+- 或使用"租借模式"：任务有租期，超时后重新入队
 
-#### RedisStorage 生产配置
+#### 场景 3：并发写的性能瓶颈
 
-```python
-from huey import RedisHuey
-
-# 推荐配置
-huey = RedisHuey(
-    'my-app',
-    url='redis://localhost:6379/0',
-    blocking=True,           # 使用阻塞式 dequeue，减少轮询
-    read_timeout=1,           # 阻塞超时时间
-    notify_result=True,       # 结果通知，降低等待延迟
-    notify_result_ttl=86400,  # 通知 TTL
-)
-
-# Redis 服务端配置建议 (redis.conf):
-# appendonly yes
-# appendfsync everysec  # 或 always 追求最高安全
-# aof-use-rdb-preamble yes
-```
-
-#### SqliteStorage 生产配置
-
-```python
-from huey import SqliteHuey
-
-# 最高可靠性配置
-huey = SqliteHuey(
-    'my-app',
-    filename='huey_tasks.db',
-    cache_mb=64,              # 增大缓存
-    fsync=True,                # 启用 FULL 同步模式 ⚠️
-    journal_mode='wal',        # WAL 模式
-    timeout=10,                # 锁等待超时
-    strict_fifo=True,          # 严格 FIFO 顺序
-)
-
-# 注意：fsync=True 会显著降低写入性能
-# 如果任务可以接受少量丢失风险，可保持 fsync=False（默认）
-```
+| 后端 | 瓶颈 | 缓解方式 |
+|------|------|----------|
+| MemoryStorage | GIL + 锁竞争 | 只适用于开发测试 |
+| RedisStorage | 网络 + Redis 单线程 | 使用 pipeline、连接池 |
+| SqliteStorage | 锁竞争 + 磁盘 IO | 使用 WAL 模式、调整 cache_size |
 
 ---
 
-## 六、代码缺陷与改进建议
+## 六、代码缺陷与改进建议（修正版）
 
 ### 6.1 MemoryStorage dequeue 竞态问题
 
@@ -995,7 +831,7 @@ def put_if_empty(self, key, value):
         return True
 ```
 
-### 6.3 RedisStorage pop_data 非原子问题
+### 6.3 RedisStorage.pop_data 的边缘情况问题
 
 **问题代码** (`storage.py:545-551`):
 
@@ -1005,13 +841,22 @@ def pop_data(self, key):
     pipe.hexists(self.result_key, key)
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
-    exists, val, n = pipe.execute()  # Pipeline 不是事务！
-    return EmptyData if not exists else val
+    exists, val, n = pipe.execute()
+    return EmptyData if not exists else val  # 忽略了 hdel 的返回值 n
 ```
 
-**问题**: 两个客户端同时调用 `pop_data` 可能都获取到相同的值。
+**问题分析**：
+- 虽然在正常并发场景下是安全的
+- 但代码忽略了 `hdel` 的返回值 `n`
+- 在极端场景（如 key 在 HEXISTS 之后、HGET 之前过期）可能有问题
 
-**修复建议**: 使用 Lua 脚本或 MULTI/EXEC 事务：
+**注意**：这个问题的实际影响非常有限，因为：
+1. Redis 的过期是惰性的，HEXISTS 会触发过期检查
+2. 如果 key 已过期，HEXISTS 返回 0，代码正确返回 EmptyData
+
+**但为了代码严谨性，建议的改进**：
+
+**方案 A：使用 Lua 脚本（最严谨）**
 
 ```python
 POP_DATA_LUA = """
@@ -1029,27 +874,211 @@ def pop_data(self, key):
     return EmptyData if result is None else result
 ```
 
+**方案 B：检查 hdel 的返回值**
+
+```python
+def pop_data(self, key):
+    pipe = self.conn.pipeline()
+    pipe.hexists(self.result_key, key)
+    pipe.hget(self.result_key, key)
+    pipe.hdel(self.result_key, key)
+    exists, val, n = pipe.execute()
+    # 确保确实删除了东西
+    return val if n == 1 else EmptyData
+```
+
+### 6.4 RedisExpireStorage 的设计启示
+
+`RedisExpireStorage.pop_data = peek_data` 这个设计告诉我们：
+
+1. **"读取并删除"语义不是必须的**：很多场景下，结果可以被多次读取
+2. **TTL 过期是更好的清理策略**：不需要显式删除，让 Redis 自动处理
+3. **并发问题可以通过设计避免**：与其修复并发 bug，不如从设计上消除并发风险
+
+**建议**：
+- 如果业务场景需要结果可重复读取，考虑使用 `RedisExpireStorage` 或 `preserve=True`
+- 不要过度依赖 `pop_data` 的"只能消费一次"语义
+
 ---
 
-## 七、总结
+## 七、后端选择建议（修正版）
 
-Huey 的存储层设计体现了良好的抽象与实现分离：
+### 7.1 决策树
 
-1. **抽象层** (`BaseStorage`) 定义了清晰的接口契约，涵盖队列、调度、KV 存储、计数器四大功能域。
+```
+                    开始
+                      │
+                      ▼
+           ┌──────────────────────┐
+           │   需要持久化存储吗？   │
+           └──────────────────────┘
+              │              │
+             否              是
+              │              │
+              ▼              ▼
+    ┌────────────────┐ ┌────────────────────┐
+    │  MemoryStorage │ │   需要多进程吗？    │
+    │  (开发测试)    │ └────────────────────┘
+    └────────────────┘    │            │
+                         否            是
+                          │            │
+                          ▼            ▼
+                ┌──────────────┐ ┌──────────────────┐
+                │ SqliteStorage│ │   结果需要多次    │
+                │ (单进程生产)  │ │   读取吗？        │
+                └──────────────┘ └──────────────────┘
+                                    │          │
+                                   否          是
+                                    │          │
+                                    ▼          ▼
+                            ┌──────────┐ ┌─────────────────┐
+                            │RedisStorage│ │RedisExpireStorage│
+                            │(默认实现)  │ │ (带 TTL 过期)  │
+                            └──────────┘ └─────────────────┘
+```
 
-2. **三个实现**各有取舍：
-   - **MemoryStorage**: 最简单但最不可靠，适合开发测试
-   - **RedisStorage**: 最健壮，适合高并发生产环境
-   - **SqliteStorage**: 零依赖，适合中小规模单进程部署
+### 7.2 详细对比表（修正版）
 
-3. **原子性保证**差异显著：
-   - Redis 依赖单线程模型和 Lua 脚本
-   - SQLite 依赖事务和锁
-   - MemoryStorage 存在已知的线程安全缺陷
+| 维度 | MemoryStorage | RedisStorage | RedisExpireStorage | SqliteStorage |
+|------|---------------|--------------|-------------------|---------------|
+| **持久化** | ❌ 无 | ✅ 可配置 | ✅ 可配置 | ✅ 天然持久化 |
+| **多进程** | ❌ 不支持 | ✅ 完美支持 | ✅ 完美支持 | ⚠️ 支持但有锁竞争 |
+| **原子性** | ⚠️ 部分操作有缺陷 | ✅ 实际安全 | ✅ 安全 | ✅ 事务保证 |
+| **pop_data 语义** | 读取并删除 | 读取并删除 | 仅读取 | 读取并删除 |
+| **结果可重复读** | 依赖 Result 缓存 | 依赖 Result 缓存 | ✅ 原生支持 | 依赖 Result 缓存 |
+| **并发性能** | ⚠️ 锁竞争瓶颈 | ✅ 优秀 | ✅ 优秀 | ⚠️ 一般 |
+| **崩溃恢复** | ❌ 无法恢复 | ⚠️ 取决于配置 | ⚠️ 取决于配置 | ⚠️ 取决于 synchronous |
+| **部署复杂度** | ✅ 零依赖 | ⚠️ 需维护 Redis | ⚠️ 需维护 Redis | ✅ 零依赖（文件） |
+| **适用场景** | 开发测试 | 高并发生产 | 结果需多次读取 | 中小规模单进程 |
 
-4. **可靠性**取决于：
-   - 持久化机制（无 vs RDB/AOF vs 磁盘文件）
-   - 同步策略（fsync 配置）
-   - 原子操作的正确实现
+### 7.3 配置最佳实践
 
-选择后端时应根据实际需求权衡：如果追求简单和零依赖，选 SQLite；如果追求高并发和多进程，选 Redis；如果只是开发测试，MemoryStorage 足够。
+#### RedisStorage 生产配置
+
+```python
+from huey import RedisHuey
+
+# 推荐配置
+huey = RedisHuey(
+    'my-app',
+    url='redis://localhost:6379/0',
+    blocking=True,           # 使用阻塞式 dequeue，减少轮询
+    read_timeout=1,           # 阻塞超时时间
+    notify_result=True,       # 结果通知，降低等待延迟
+    notify_result_ttl=86400,  # 通知 TTL
+)
+
+# Redis 服务端配置建议 (redis.conf):
+# appendonly yes
+# appendfsync everysec  # 或 always 追求最高安全
+# aof-use-rdb-preamble yes
+```
+
+#### RedisExpireStorage 配置
+
+```python
+from huey import RedisExpireHuey
+
+# 结果可重复读取的场景
+huey = RedisExpireHuey(
+    'my-app',
+    expire_time=86400,  # 结果 24 小时后自动过期
+    url='redis://localhost:6379/0',
+)
+
+# 优点：
+# - pop_data 不删除结果，可多次读取
+# - 依赖 TTL 自动清理，无并发风险
+```
+
+#### SqliteStorage 生产配置
+
+```python
+from huey import SqliteHuey
+
+# 最高可靠性配置
+huey = SqliteHuey(
+    'my-app',
+    filename='huey_tasks.db',
+    cache_mb=64,              # 增大缓存
+    fsync=True,                # 启用 FULL 同步模式 ⚠️
+    journal_mode='wal',        # WAL 模式
+    timeout=10,                # 锁等待超时
+    strict_fifo=True,          # 严格 FIFO 顺序
+)
+
+# 注意：fsync=True 会显著降低写入性能
+# 如果任务可以接受少量丢失风险，可保持 fsync=False（默认）
+```
+
+---
+
+## 八、总结（修正版）
+
+### 8.1 关键修正点
+
+在重新核对代码后，我发现了之前分析中的几个重要错误：
+
+1. **RedisStorage.pop_data 的实际语义**：
+   - 之前错误地认为"pipeline 非原子，存在竞态"
+   - 实际上 Redis 单线程模型保证 pipeline 中的命令**连续执行**
+   - **不会出现两个客户端都拿到值的情况**
+   - 但代码忽略了 `hdel` 的返回值，在极端场景可能有问题
+
+2. **RedisExpireStorage 的特殊设计**：
+   - `pop_data = peek_data` — 明确不做删除操作
+   - 这是设计者对并发问题的**明确应对策略**
+   - 依赖 TTL 自动过期而非显式删除
+
+3. **Result 类的缓存机制**：
+   - 同一个 `Result` 对象多次调用 `get()` 只会调用一次 `pop_data`
+   - 这大大减少了并发冲突的可能性
+
+4. **实际使用场景**：
+   - 大多数 `pop_data` 调用场景天然就是单线程的
+   - 撤销键清理：单消费者执行
+   - Chord 结果收集：`incr` 原子性保证只有一个线程执行
+   - 撤销状态检查：默认使用 `peek=True`
+
+### 8.2 核心结论
+
+1. **存储层抽象设计良好**：
+   - `BaseStorage` 定义了清晰的接口契约
+   - 各后端实现遵循"依赖倒置"原则
+
+2. **三个实现各有取舍**：
+   - **MemoryStorage**: 最简单但最不可靠，适合开发测试；存在 `dequeue` 无锁、`put_if_empty` 非原子等已知缺陷
+   - **RedisStorage**: 最健壮，适合高并发生产环境；`pop_data` 实际并发安全但不是严格事务
+   - **RedisExpireStorage**: 设计上避免了"读取并删除"的并发问题，适合结果需多次读取的场景
+   - **SqliteStorage**: 零依赖，适合中小规模单进程部署；事务保证原子性
+
+3. **"读取并删除"语义的实际风险很低**：
+   - 大多数场景有保护机制（Result 缓存、单消费者执行等）
+   - 各后端的实际实现都是并发安全的
+   - 但这个语义本身有争议：结果是否应该只能被消费一次？
+
+4. **可靠性取决于持久化配置**：
+   - MemoryStorage: 进程崩溃即丢失
+   - Redis: 取决于 RDB/AOF 配置
+   - SQLite: 取决于 synchronous 配置
+
+### 8.3 最终建议
+
+1. **开发测试**：使用 `MemoryStorage`
+2. **高并发生产**：使用 `RedisStorage` 或 `RedisExpireStorage`
+   - 如果结果需要可重复读取，选择 `RedisExpireStorage`
+   - 如果严格需要"读取即删除"语义，选择 `RedisStorage`
+3. **中小规模单进程**：使用 `SqliteStorage`
+4. **对于 `pop_data`**：
+   - 不需要过度担心并发问题
+   - 但考虑使用 `preserve=True` 或 `RedisExpireStorage` 来获得更灵活的语义
+
+### 8.4 代码缺陷优先级
+
+| 缺陷 | 影响 | 优先级 |
+|------|------|--------|
+| MemoryStorage.dequeue 无锁 | 多线程环境可能崩溃 | 高 |
+| MemoryStorage.put_if_empty 非原子 | 分布式锁可能失效 | 中 |
+| RedisStorage.pop_data 忽略 hdel 返回值 | 极端场景可能问题 | 低 |
+
+Huey 的存储层设计整体是合理和健壮的，大多数"问题"在实际使用场景下影响有限。

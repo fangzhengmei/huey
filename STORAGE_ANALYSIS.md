@@ -234,41 +234,79 @@ def pop_data(self, key):
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
     exists, val, n = pipe.execute()
-    return EmptyData if not exists else val
+    return EmptyData if not exists else val  # ⚠️ 只检查 exists，忽略了 hdel 的返回值 n
 ```
 
-**关键分析**：
+**关键语义分析**：
 
-1. **Redis 单线程执行模型**：
-   - Redis 使用单线程事件循环处理所有客户端请求
-   - 一个客户端的 pipeline 命令会被**连续执行**，不会被其他客户端的命令打断
-   - 这意味着虽然没有使用 MULTI/EXEC 事务，但实际执行是"批处理原子"的
+1. **Redis 单线程模型**：
+   - Redis 使用单线程事件循环，所有命令**串行执行**（不会并行）
+   - 但这**不保证**一个客户端的多个命令作为整体连续执行
 
-2. **并发场景分析**：
-   ```
-   Client A 发送: [HEXISTS, HGET, HDEL]
-   Client B 发送: [HEXISTS, HGET, HDEL]
-   
-   Redis 执行顺序（取决于网络调度）：
-   要么：
-     1. A 的 HEXISTS → 1
-     2. A 的 HGET → value
-     3. A 的 HDEL → 1 (key 被删除)
-     4. B 的 HEXISTS → 0 (key 已不存在)
-     5. B 的 HGET → nil
-     6. B 的 HDEL → 0
-   结果：A 拿到 value，B 拿到 EmptyData
-   
-   要么：
-     1. B 的 HEXISTS → 1
-     ... (类似)
-   结果：B 拿到 value，A 拿到 EmptyData
-   ```
+2. **Pipeline vs 事务**：
+   - `pipeline()` 只是客户端缓冲命令，一次性发送
+   - **不是事务**：不同客户端的命令**可能交错**
+   - Redis 不保证一个客户端的所有 pipeline 命令连续执行
+   - 需要真正的原子性应该用：
+     - **Lua 脚本**：整个脚本原子执行
+     - **MULTI/EXEC 事务**：命令批量原子执行
 
-3. **实际结论**：
-   - **不会出现两个客户端都拿到值的情况**
-   - 但代码忽略了 `hdel` 的返回值 `n`，只检查了 `exists`
-   - 这在正常场景下是安全的，但在极端场景（如 key 在 HEXISTS 和 HGET 之间过期）可能有问题
+3. **代码缺陷分析**：
+
+```python
+return EmptyData if not exists else val
+```
+
+**问题**：
+- 只检查 `hexists` 的返回值 `exists`
+- 忽略了 `hdel` 的返回值 `n`
+- 不检查 `hget` 的返回值 `val` 是否为 `None`
+
+**风险场景**：
+
+**场景 1：命令无交错（正常情况）**
+```
+Client A: HEXISTS → 1
+Client A: HGET → value
+Client A: HDEL → 1
+Client B: HEXISTS → 0 (key 已不存在)
+Client B: HGET → nil
+Client B: HDEL → 0
+
+结果：A 返回 value，B 返回 EmptyData ✓
+```
+
+**场景 2：命令交错（理论上可能，实际中罕见）**
+```
+Client A: HEXISTS → 1
+Client B: HEXISTS → 1 (key 还存在)
+Client A: HGET → value
+Client B: HGET → value (⚠️ 两个客户端都拿到了 value!)
+Client A: HDEL → 1
+Client B: HDEL → 0 (key 已被删除)
+
+结果：A 返回 value，B 也返回 value ✗ (重复消费)
+```
+
+**场景 3：hdel 返回 0 的情况**
+```
+Client A: HEXISTS → 1
+Client A: HGET → value
+Client A: HDEL → 1
+Client B: HEXISTS → 0 (但如果中间 key 被其他方式删除呢？)
+...
+
+更关键的是：代码不检查 n = hdel 的返回值
+如果 hexists=1 但 hdel=0，代码仍然返回 val（可能是 None 或旧值）
+```
+
+4. **实际风险评估**：
+
+在实际使用中，pipeline 命令通常会被连续执行（因为网络层会合并数据），所以场景 2 很少发生。但**代码仍然有缺陷**：
+
+- **语义上**：`pop_data` 应该是"原子性读取并删除"
+- **实现上**：pipeline 不是原子的，且忽略了 `hdel` 的返回值
+- **风险等级**：低（实际场景中很少触发），但确实是设计缺陷
 
 ##### RedisExpireStorage 的特殊设计
 
@@ -283,7 +321,7 @@ pop_data = peek_data
 - `RedisExpireStorage` **明确选择不做破坏性读取**
 - `pop_data` 被重定义为 `peek_data` 的别名
 - 数据的删除完全依赖 Redis 的 TTL 自动过期机制
-- 这是设计者对并发问题的**明确应对策略**
+- 这是设计者对并发问题的**明确应对策略**：**从设计上消除"读取并删除"的并发风险**
 
 ---
 
@@ -419,15 +457,20 @@ def pop_data(self, key):
             if result is not None:
                 curs.execute('delete from kv where queue=? and key=?',
                              (self.name, key))
-                if curs.rowcount == 1:
+                if curs.rowcount == 1:  # ⚠️ 检查 rowcount！
                     return result[0]
         return EmptyData
 ```
 
 **原子性保证**：
-- SQLite 3.35+: `DELETE ... RETURNING` 是单条 SQL 语句，原子操作
-- 旧版本: 整个操作在 `BEGIN EXCLUSIVE` 事务中，且有 `rowcount` 检查
+- SQLite 3.35+: `DELETE ... RETURNING` 是单条 SQL 语句，**原子操作**
+- 旧版本: 整个操作在 `BEGIN EXCLUSIVE` 事务中，且**检查 `rowcount`**
 - 双重保护：`threading.Lock()` + `BEGIN EXCLUSIVE`
+
+**与 RedisStorage 的对比**：
+- SqliteStorage **检查了 `rowcount`**，确保确实删除了一行
+- RedisStorage **忽略了 `hdel` 的返回值 `n`**
+- 这是 SqliteStorage 更严谨的地方
 
 ---
 
@@ -576,17 +619,31 @@ def pop_data(self, key):
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
     exists, val, n = pipe.execute()
-    return EmptyData if not exists else val
+    return EmptyData if not exists else val  # ⚠️ 忽略了 n
 ```
 
 **分析**：
-- 不是 MULTI/EXEC 事务
-- 但 Redis 单线程模型保证 pipeline 中的命令**连续执行**
-- **不会出现两个客户端都拿到值的情况**
-- 但代码忽略了 `hdel` 的返回值 `n`，只检查了 `exists`
-- 在极端场景（如 key 过期）可能有问题
 
-**结论**：✅ 实际场景下是并发安全的（虽然不是严格的"原子事务"）
+| 维度 | 分析 |
+|------|------|
+| **pipeline 语义** | 只是客户端缓冲，不是事务 |
+| **原子性** | ❌ 不是原子操作 |
+| **命令交错** | 理论上可能，实际中罕见 |
+| **代码缺陷** | 忽略 `hdel` 返回值 `n`，只检查 `exists` |
+| **实际风险** | 低（实际场景中很少触发） |
+
+**关键澄清**：
+
+之前的表述"非事务但连续执行"是**语义偏差**：
+- **错误**："pipeline 命令会连续执行"
+- **正确**："pipeline 不是事务，不保证连续执行；实际中通常连续执行，但理论上可能交错"
+
+**更准确的表述**：
+- Redis 单线程模型保证命令**串行执行**（不会并行）
+- 但**不保证**一个客户端的多个命令作为整体连续执行
+- pipeline 命令**可能**被其他客户端的命令交错
+
+**结论**：⚠️ 实际风险低，但不是严格原子的，且代码有缺陷（忽略 `n`）
 
 #### RedisExpireStorage.pop_data
 
@@ -611,14 +668,18 @@ def pop_data(self, key):
         else:
             curs.execute('select ...')
             curs.execute('delete ...')
-            if curs.rowcount == 1:  # 验证
+            if curs.rowcount == 1:  # ⚠️ 检查 rowcount！
                 return result[0]
 ```
 
 **分析**：
 - SQLite 3.35+: `DELETE ... RETURNING` 原子操作
-- 旧版本: 事务 + `rowcount` 检查
+- 旧版本: 事务 + **`rowcount` 检查**
 - 双重保护：`threading.Lock()` + `BEGIN EXCLUSIVE`
+
+**与 RedisStorage 的关键区别**：
+- SqliteStorage **检查 `rowcount`**，确保确实删除了
+- RedisStorage **忽略 `hdel` 返回值**
 
 **结论**：✅ 完全原子的
 
@@ -630,18 +691,20 @@ def pop_data(self, key):
 | **read_schedule** | ✅ 有锁保护 | ✅ Lua 脚本 | ✅ Lua 脚本 | ✅ 事务保护 |
 | **put_if_empty** | ❌ 先检查后写入 | ✅ HSETNX | ✅ SETNX | ✅ INSERT OR ABORT |
 | **incr** | ✅ 有锁保护 | ✅ HINCRBY | ✅ INCR | ✅ UPSERT |
-| **pop_data** | ✅ dict.pop 原子 | ⚠️ 实际安全但非事务 | ✅ 无删除操作 | ✅ 事务保护 |
+| **pop_data** | ✅ dict.pop 原子 | ⚠️ 非事务+忽略返回值 | ✅ 无删除操作 | ✅ 事务+rowcount |
 
 ### 4.3 关键差异说明
 
-#### RedisStorage vs RedisExpireStorage
+#### RedisStorage vs RedisExpireStorage vs SqliteStorage
 
-| 维度 | RedisStorage | RedisExpireStorage |
-|------|--------------|-------------------|
-| pop_data 语义 | 读取并删除 | 仅读取（不删除） |
-| 结果清理方式 | 显式删除 | 依赖 TTL 自动过期 |
-| 并发风险 | 极低（实际安全） | 无（设计上避免） |
-| 适用场景 | 默认场景 | 需要结果可重复读取 |
+| 维度 | RedisStorage | RedisExpireStorage | SqliteStorage |
+|------|--------------|-------------------|---------------|
+| pop_data 语义 | 读取并删除 | 仅读取（不删除） | 读取并删除 |
+| 实现方式 | pipeline | pipeline (同 peek) | 事务 |
+| 原子性 | ⚠️ 非事务 | ✅ 无删除操作 | ✅ 事务 |
+| 删除验证 | ❌ 忽略 hdel 返回值 | N/A | ✅ 检查 rowcount |
+| 并发风险 | 低（理论上可能） | 无 | 无 |
+| 设计意图 | 默认实现 | 从设计上消除并发风险 | 严谨的事务实现 |
 
 #### 设计意图分析
 
@@ -651,7 +714,10 @@ def pop_data(self, key):
 2. **"读取并删除"语义本身有争议**：
    - 如果结果只能被消费一次，那"谁能消费到"变成了竞态
    - 如果结果可以被多次读取，就不需要破坏性读取
-3. **Huey 的 Result 缓存机制已经缓解了这个问题**：同一个对象多次调用不会重复读取
+3. **RedisStorage 的实现有缺陷**：
+   - 使用 pipeline 而非 Lua 脚本或 MULTI/EXEC
+   - 忽略了 `hdel` 的返回值
+   - 这是一个"凑合能用但不严谨"的实现
 
 ---
 
@@ -663,14 +729,47 @@ def pop_data(self, key):
 
 **各后端表现**：
 
-| 后端 | 实际行为 | 风险等级 |
-|------|----------|----------|
-| MemoryStorage | `dict.pop` 原子，只有一个线程能拿到 | ✅ 安全 |
-| RedisStorage | Pipeline 连续执行，只有一个客户端能拿到 | ✅ 实际安全 |
-| RedisExpireStorage | 不做删除，所有客户端都能拿到 | ✅ 设计如此 |
-| SqliteStorage | 事务保护，只有一个连接能拿到 | ✅ 安全 |
+| 后端 | 实际行为 | 风险等级 | 关键因素 |
+|------|----------|----------|----------|
+| MemoryStorage | `dict.pop` 原子，只有一个线程能拿到 | ✅ 安全 | CPython GIL |
+| RedisStorage | 通常只有一个客户端能拿到；理论上可能重复 | ⚠️ 低风险 | pipeline 非事务+忽略返回值 |
+| RedisExpireStorage | 不做删除，所有客户端都能拿到 | ✅ 设计如此 | 无删除操作 |
+| SqliteStorage | 事务保护，只有一个连接能拿到 | ✅ 安全 | 事务+rowcount 检查 |
 
-**关键修正**：之前错误地认为 RedisStorage 有竞态风险，实际上 Redis 单线程模型保证了 pipeline 命令的连续执行。
+**RedisStorage 的详细风险分析**：
+
+**正常情况（99.9%+）**：
+```
+Client A 的 pipeline 命令连续执行
+Client A: HEXISTS → 1, HGET → value, HDEL → 1
+Client B: HEXISTS → 0, HGET → nil, HDEL → 0
+
+结果：A 返回 value，B 返回 EmptyData ✓
+```
+
+**理论上的异常情况（实际罕见）**：
+```
+Client A: HEXISTS → 1
+Client B: HEXISTS → 1
+Client A: HGET → value
+Client B: HGET → value (⚠️ 两个都拿到了!)
+Client A: HDEL → 1
+Client B: HDEL → 0
+
+结果：A 和 B 都返回 value ✗ (重复消费)
+```
+
+**代码缺陷加剧风险**：
+```python
+return EmptyData if not exists else val  # 只检查 exists
+
+如果 hexists=1 但 hdel=0（其他客户端已删除），代码仍然返回 val
+```
+
+**风险等级评估**：
+- **理论风险**：存在（pipeline 非事务 + 忽略返回值）
+- **实际风险**：低（pipeline 命令通常连续执行，且实际并发场景少见）
+- **代码质量**：有缺陷（不检查返回值）
 
 #### 场景 2：消费者崩溃，任务正在执行中
 
@@ -753,6 +852,36 @@ def pop_data(self, key):
 2. **preserve 参数**：`result.get(preserve=True)` 使用 `peek_data` 而非 `pop_data`
 3. **RedisExpireStorage**：设计上选择不做删除，依赖 TTL 过期
 
+**真正的问题**：
+
+RedisStorage 的实现有两个层次的问题：
+
+1. **语义问题**：pipeline 不是事务
+2. **代码问题**：忽略 `hdel` 的返回值
+
+**更安全的实现应该是**：
+
+```python
+# 方案 A：使用 Lua 脚本（最严谨）
+POP_DATA_LUA = """
+local val = redis.call('hget', KEYS[1], KEYS[2])
+if val ~= false then
+    redis.call('hdel', KEYS[1], KEYS[2])
+    return val
+else
+    return nil
+end"""
+
+# 方案 B：检查 hdel 的返回值
+def pop_data(self, key):
+    pipe = self.conn.pipeline()
+    pipe.hexists(self.result_key, key)
+    pipe.hget(self.result_key, key)
+    pipe.hdel(self.result_key, key)
+    exists, val, n = pipe.execute()
+    return val if n == 1 else EmptyData  # 检查 n，而非 exists
+```
+
 #### 场景 2：消费者崩溃后的任务丢失
 
 **问题**：任务出队后消费者崩溃，任务永远丢失
@@ -768,14 +897,6 @@ def pop_data(self, key):
 **可能的改进方向**（参考其他消息队列）：
 - 使用"确认模式"：任务出队后不立即删除，等待消费者 ack
 - 或使用"租借模式"：任务有租期，超时后重新入队
-
-#### 场景 3：并发写的性能瓶颈
-
-| 后端 | 瓶颈 | 缓解方式 |
-|------|------|----------|
-| MemoryStorage | GIL + 锁竞争 | 只适用于开发测试 |
-| RedisStorage | 网络 + Redis 单线程 | 使用 pipeline、连接池 |
-| SqliteStorage | 锁竞争 + 磁盘 IO | 使用 WAL 模式、调整 cache_size |
 
 ---
 
@@ -831,7 +952,7 @@ def put_if_empty(self, key, value):
         return True
 ```
 
-### 6.3 RedisStorage.pop_data 的边缘情况问题
+### 6.3 RedisStorage.pop_data 的缺陷（重要修正）
 
 **问题代码** (`storage.py:545-551`):
 
@@ -842,27 +963,48 @@ def pop_data(self, key):
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
     exists, val, n = pipe.execute()
-    return EmptyData if not exists else val  # 忽略了 hdel 的返回值 n
+    return EmptyData if not exists else val  # ⚠️ 问题：只检查 exists，忽略 n
 ```
 
 **问题分析**：
-- 虽然在正常并发场景下是安全的
-- 但代码忽略了 `hdel` 的返回值 `n`
-- 在极端场景（如 key 在 HEXISTS 之后、HGET 之前过期）可能有问题
 
-**注意**：这个问题的实际影响非常有限，因为：
-1. Redis 的过期是惰性的，HEXISTS 会触发过期检查
-2. 如果 key 已过期，HEXISTS 返回 0，代码正确返回 EmptyData
+| 问题 | 说明 |
+|------|------|
+| **pipeline 非事务** | 不同客户端的命令可能交错 |
+| **忽略 hdel 返回值** | 只检查 `exists`，不检查 `n = hdel` 的返回值 |
+| **语义不严谨** | "读取并删除"应该是原子的，但实现不是 |
 
-**但为了代码严谨性，建议的改进**：
+**实际风险**：
 
-**方案 A：使用 Lua 脚本（最严谨）**
+**风险 1：命令交错（理论上）**
+```
+Client A: HEXISTS → 1
+Client B: HEXISTS → 1
+Client A: HGET → value
+Client B: HGET → value
+Client A: HDEL → 1
+Client B: HDEL → 0
+
+结果：A 和 B 都返回 value（重复消费）
+```
+
+**风险 2：hdel 返回 0 但代码忽略**
+```
+Client A: HEXISTS → 1
+Client A: HGET → value
+Client A: HDEL → 0 (⚠️ 其他客户端已删除)
+
+代码检查 exists=1，返回 val，但实际上 key 已被其他客户端删除
+```
+
+**修复建议**：
+
+**方案 A：使用 Lua 脚本（最严谨，推荐）**
 
 ```python
 POP_DATA_LUA = """
-local exists = redis.call('hexists', KEYS[1], KEYS[2])
-if exists == 1 then
-    local val = redis.call('hget', KEYS[1], KEYS[2])
+local val = redis.call('hget', KEYS[1], KEYS[2])
+if val ~= false then
     redis.call('hdel', KEYS[1], KEYS[2])
     return val
 else
@@ -870,11 +1012,16 @@ else
 end"""
 
 def pop_data(self, key):
-    result = self._pop_data_script(keys=[self.result_key, key])
+    result = self.conn.eval(POP_DATA_LUA, 2, self.result_key, key)
     return EmptyData if result is None else result
 ```
 
-**方案 B：检查 hdel 的返回值**
+**优点**：
+- Lua 脚本在 Redis 中**原子执行**
+- 不需要检查返回值（脚本逻辑保证）
+- 最严谨的实现
+
+**方案 B：检查 hdel 的返回值（最小改动）**
 
 ```python
 def pop_data(self, key):
@@ -883,9 +1030,47 @@ def pop_data(self, key):
     pipe.hget(self.result_key, key)
     pipe.hdel(self.result_key, key)
     exists, val, n = pipe.execute()
-    # 确保确实删除了东西
+    # 关键改动：检查 n（hdel 的返回值），而非 exists
     return val if n == 1 else EmptyData
 ```
+
+**优点**：
+- 最小改动
+- 确保确实删除了东西
+- 解决了"hdel 返回 0 但代码忽略"的问题
+
+**缺点**：
+- 仍然不是事务（命令可能交错）
+- 理论上仍有风险
+
+**方案 C：使用 MULTI/EXEC 事务**
+
+```python
+def pop_data(self, key):
+    pipe = self.conn.pipeline(transaction=True)  # 启用事务
+    pipe.hexists(self.result_key, key)
+    pipe.hget(self.result_key, key)
+    pipe.hdel(self.result_key, key)
+    exists, val, n = pipe.execute()
+    return val if n == 1 else EmptyData
+```
+
+**优点**：
+- MULTI/EXEC 保证命令作为整体执行
+- 更安全
+
+**缺点**：
+- 性能略低（事务开销）
+- 仍然需要检查返回值
+
+**风险等级评估**：
+
+| 缺陷 | 实际影响 | 优先级 |
+|------|----------|--------|
+| pipeline 非事务 | 理论风险，实际罕见 | 低 |
+| 忽略 hdel 返回值 | 代码不严谨，可能触发边界问题 | 中 |
+
+**建议**：至少采用方案 B（检查 `n`），如果追求严谨采用方案 A（Lua 脚本）。
 
 ### 6.4 RedisExpireStorage 的设计启示
 
@@ -898,6 +1083,7 @@ def pop_data(self, key):
 **建议**：
 - 如果业务场景需要结果可重复读取，考虑使用 `RedisExpireStorage` 或 `preserve=True`
 - 不要过度依赖 `pop_data` 的"只能消费一次"语义
+- RedisStorage 的实现有缺陷，生产环境中如果有严格的一致性要求，考虑使用 `RedisExpireStorage` 或 SqliteStorage
 
 ---
 
@@ -933,7 +1119,7 @@ def pop_data(self, key):
                                     ▼          ▼
                             ┌──────────┐ ┌─────────────────┐
                             │RedisStorage│ │RedisExpireStorage│
-                            │(默认实现)  │ │ (带 TTL 过期)  │
+                            │(注意缺陷)  │ │ (更安全的设计)  │
                             └──────────┘ └─────────────────┘
 ```
 
@@ -943,17 +1129,18 @@ def pop_data(self, key):
 |------|---------------|--------------|-------------------|---------------|
 | **持久化** | ❌ 无 | ✅ 可配置 | ✅ 可配置 | ✅ 天然持久化 |
 | **多进程** | ❌ 不支持 | ✅ 完美支持 | ✅ 完美支持 | ⚠️ 支持但有锁竞争 |
-| **原子性** | ⚠️ 部分操作有缺陷 | ✅ 实际安全 | ✅ 安全 | ✅ 事务保证 |
+| **原子性** | ⚠️ 部分操作有缺陷 | ⚠️ pop_data 有缺陷 | ✅ 安全 | ✅ 事务保证 |
 | **pop_data 语义** | 读取并删除 | 读取并删除 | 仅读取 | 读取并删除 |
+| **pop_data 实现质量** | ✅ 原子 | ⚠️ 非事务+忽略返回值 | ✅ 无删除操作 | ✅ 事务+rowcount |
 | **结果可重复读** | 依赖 Result 缓存 | 依赖 Result 缓存 | ✅ 原生支持 | 依赖 Result 缓存 |
 | **并发性能** | ⚠️ 锁竞争瓶颈 | ✅ 优秀 | ✅ 优秀 | ⚠️ 一般 |
 | **崩溃恢复** | ❌ 无法恢复 | ⚠️ 取决于配置 | ⚠️ 取决于配置 | ⚠️ 取决于 synchronous |
 | **部署复杂度** | ✅ 零依赖 | ⚠️ 需维护 Redis | ⚠️ 需维护 Redis | ✅ 零依赖（文件） |
-| **适用场景** | 开发测试 | 高并发生产 | 结果需多次读取 | 中小规模单进程 |
+| **适用场景** | 开发测试 | 高并发生产（注意缺陷） | 结果需多次读取 | 中小规模单进程 |
 
 ### 7.3 配置最佳实践
 
-#### RedisStorage 生产配置
+#### RedisStorage 生产配置（注意缺陷）
 
 ```python
 from huey import RedisHuey
@@ -968,18 +1155,25 @@ huey = RedisHuey(
     notify_result_ttl=86400,  # 通知 TTL
 )
 
+# 注意事项：
+# 1. RedisStorage.pop_data 使用 pipeline 而非事务，理论上有并发风险
+# 2. 代码忽略了 hdel 的返回值
+# 3. 如果严格要求结果只能消费一次，考虑：
+#    a. 使用 RedisExpireHuey（不做删除）
+#    b. 或使用 SqliteHuey（事务保证）
+
 # Redis 服务端配置建议 (redis.conf):
 # appendonly yes
 # appendfsync everysec  # 或 always 追求最高安全
 # aof-use-rdb-preamble yes
 ```
 
-#### RedisExpireStorage 配置
+#### RedisExpireStorage 配置（更安全的选择）
 
 ```python
 from huey import RedisExpireHuey
 
-# 结果可重复读取的场景
+# 结果可重复读取的场景（推荐用于生产，更安全）
 huey = RedisExpireHuey(
     'my-app',
     expire_time=86400,  # 结果 24 小时后自动过期
@@ -988,15 +1182,16 @@ huey = RedisExpireHuey(
 
 # 优点：
 # - pop_data 不删除结果，可多次读取
-# - 依赖 TTL 自动清理，无并发风险
+# - 从设计上消除了"读取并删除"的并发风险
+# - 依赖 TTL 自动清理
 ```
 
-#### SqliteStorage 生产配置
+#### SqliteStorage 生产配置（最严谨）
 
 ```python
 from huey import SqliteHuey
 
-# 最高可靠性配置
+# 最高可靠性配置（事务保证）
 huey = SqliteHuey(
     'my-app',
     filename='huey_tasks.db',
@@ -1007,9 +1202,23 @@ huey = SqliteHuey(
     strict_fifo=True,          # 严格 FIFO 顺序
 )
 
+# 优点：
+# - pop_data 使用事务 + rowcount 检查，完全原子
+# - 最严谨的实现
+
 # 注意：fsync=True 会显著降低写入性能
 # 如果任务可以接受少量丢失风险，可保持 fsync=False（默认）
 ```
+
+### 7.4 后端选择建议（修正版）
+
+| 场景 | 推荐后端 | 理由 |
+|------|----------|------|
+| 开发测试 | MemoryStorage | 最简单，零依赖 |
+| 高并发生产 + 结果可重复读 | RedisExpireStorage | 从设计上消除并发风险 |
+| 高并发生产 + 结果只能消费一次 | RedisStorage（注意缺陷）或 SqliteStorage | RedisStorage 实际风险低；SqliteStorage 更严谨 |
+| 中小规模单进程 | SqliteStorage | 事务保证，零依赖 |
+| 严格要求数据一致性 | SqliteStorage 或 RedisExpireStorage | 最严谨的实现 |
 
 ---
 
@@ -1017,28 +1226,26 @@ huey = SqliteHuey(
 
 ### 8.1 关键修正点
 
-在重新核对代码后，我发现了之前分析中的几个重要错误：
+在重新核对代码后，我发现并修正了之前分析中的几个重要错误：
 
-1. **RedisStorage.pop_data 的实际语义**：
-   - 之前错误地认为"pipeline 非原子，存在竞态"
-   - 实际上 Redis 单线程模型保证 pipeline 中的命令**连续执行**
-   - **不会出现两个客户端都拿到值的情况**
-   - 但代码忽略了 `hdel` 的返回值，在极端场景可能有问题
+1. **Redis pipeline 的语义澄清**：
+   - **之前的错误**："pipeline 命令会连续执行"
+   - **修正后**："Redis 单线程模型保证命令串行执行，但不保证一个客户端的多个命令作为整体连续执行；pipeline 不是事务，命令可能交错"
 
-2. **RedisExpireStorage 的特殊设计**：
-   - `pop_data = peek_data` — 明确不做删除操作
-   - 这是设计者对并发问题的**明确应对策略**
-   - 依赖 TTL 自动过期而非显式删除
+2. **RedisStorage.pop_data 的缺陷分析**：
+   - **两个层次的问题**：
+     1. **语义问题**：pipeline 不是事务，命令可能交错
+     2. **代码问题**：忽略 `hdel` 的返回值 `n`，只检查 `exists`
+   - **实际风险**：低（实际场景中很少触发），但代码不严谨
 
-3. **Result 类的缓存机制**：
-   - 同一个 `Result` 对象多次调用 `get()` 只会调用一次 `pop_data`
-   - 这大大减少了并发冲突的可能性
+3. **RedisExpireStorage 的设计意图**：
+   - `pop_data = peek_data` 是**明确的设计选择**
+   - 从设计上消除"读取并删除"的并发风险
+   - 这是比 RedisStorage 更安全的实现
 
-4. **实际使用场景**：
-   - 大多数 `pop_data` 调用场景天然就是单线程的
-   - 撤销键清理：单消费者执行
-   - Chord 结果收集：`incr` 原子性保证只有一个线程执行
-   - 撤销状态检查：默认使用 `peek=True`
+4. **SqliteStorage 的严谨性**：
+   - 检查 `rowcount`，确保确实删除了一行
+   - 这是比 RedisStorage 更严谨的实现
 
 ### 8.2 核心结论
 
@@ -1046,39 +1253,47 @@ huey = SqliteHuey(
    - `BaseStorage` 定义了清晰的接口契约
    - 各后端实现遵循"依赖倒置"原则
 
-2. **三个实现各有取舍**：
-   - **MemoryStorage**: 最简单但最不可靠，适合开发测试；存在 `dequeue` 无锁、`put_if_empty` 非原子等已知缺陷
-   - **RedisStorage**: 最健壮，适合高并发生产环境；`pop_data` 实际并发安全但不是严格事务
-   - **RedisExpireStorage**: 设计上避免了"读取并删除"的并发问题，适合结果需多次读取的场景
-   - **SqliteStorage**: 零依赖，适合中小规模单进程部署；事务保证原子性
+2. **各后端实现质量差异**：
+   - **MemoryStorage**: 最简单但最不可靠，存在 `dequeue` 无锁、`put_if_empty` 非原子等已知缺陷
+   - **RedisStorage**: 性能最好，但 `pop_data` 实现有缺陷（pipeline 非事务 + 忽略返回值）
+   - **RedisExpireStorage**: 从设计上消除并发风险，最安全的 Redis 后端
+   - **SqliteStorage**: 零依赖，实现最严谨（事务 + rowcount 检查）
 
-3. **"读取并删除"语义的实际风险很低**：
+3. **"读取并删除"语义的实际风险**：
    - 大多数场景有保护机制（Result 缓存、单消费者执行等）
-   - 各后端的实际实现都是并发安全的
-   - 但这个语义本身有争议：结果是否应该只能被消费一次？
+   - RedisStorage 的理论风险在实际中很少触发
+   - 但代码确实有缺陷（忽略返回值）
 
-4. **可靠性取决于持久化配置**：
-   - MemoryStorage: 进程崩溃即丢失
-   - Redis: 取决于 RDB/AOF 配置
-   - SQLite: 取决于 synchronous 配置
+4. **真正的可靠性问题**：
+   - 消费者崩溃后任务丢失（Huey 没有 ack 机制）
+   - 持久化配置（Redis RDB/AOF、SQLite synchronous）
 
-### 8.3 最终建议
+### 8.3 代码缺陷优先级
 
-1. **开发测试**：使用 `MemoryStorage`
-2. **高并发生产**：使用 `RedisStorage` 或 `RedisExpireStorage`
-   - 如果结果需要可重复读取，选择 `RedisExpireStorage`
-   - 如果严格需要"读取即删除"语义，选择 `RedisStorage`
-3. **中小规模单进程**：使用 `SqliteStorage`
-4. **对于 `pop_data`**：
-   - 不需要过度担心并发问题
-   - 但考虑使用 `preserve=True` 或 `RedisExpireStorage` 来获得更灵活的语义
+| 缺陷 | 位置 | 实际影响 | 优先级 |
+|------|------|----------|--------|
+| MemoryStorage.dequeue 无锁 | `storage.py:324-330` | 多线程环境可能崩溃 | 高 |
+| MemoryStorage.put_if_empty 非原子 | `storage.py:217-228` | 分布式锁可能失效 | 中 |
+| RedisStorage.pop_data 忽略 hdel 返回值 | `storage.py:545-551` | 代码不严谨，边界情况可能问题 | 中 |
+| RedisStorage.pop_data 使用 pipeline 而非事务 | `storage.py:545-551` | 理论风险，实际罕见 | 低 |
 
-### 8.4 代码缺陷优先级
+### 8.4 最终建议
 
-| 缺陷 | 影响 | 优先级 |
-|------|------|--------|
-| MemoryStorage.dequeue 无锁 | 多线程环境可能崩溃 | 高 |
-| MemoryStorage.put_if_empty 非原子 | 分布式锁可能失效 | 中 |
-| RedisStorage.pop_data 忽略 hdel 返回值 | 极端场景可能问题 | 低 |
+1. **开发测试**：使用 `MemoryStorage`（简单但有缺陷）
 
-Huey 的存储层设计整体是合理和健壮的，大多数"问题"在实际使用场景下影响有限。
+2. **生产环境选择**：
+   - **首选**：`RedisExpireStorage`（从设计上消除并发风险）
+   - **次选**：`SqliteStorage`（事务保证，最严谨）
+   - **最后选择**：`RedisStorage`（注意缺陷，实际风险低但代码不严谨）
+
+3. **对于 RedisStorage**：
+   - 如果严格要求结果只能消费一次，考虑修复代码或使用其他后端
+   - 建议至少检查 `hdel` 的返回值（方案 B）
+   - 或考虑使用 Lua 脚本（方案 A，最严谨）
+
+4. **关于 pop_data 的语义**：
+   - 不要过度依赖"结果只能消费一次"的语义
+   - 考虑使用 `preserve=True` 或 `RedisExpireStorage` 获得更灵活的语义
+   - "读取并删除"本身就是一个有争议的语义，因为它引入了竞态
+
+Huey 的存储层设计整体是合理和健壮的。RedisStorage.pop_data 的缺陷在实际场景中影响有限，但确实是代码质量问题，建议在未来版本中修复。

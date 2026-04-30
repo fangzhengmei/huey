@@ -117,14 +117,16 @@ if sys.version_info[0] == 2:
     text_type = unicode
     def to_timestamp(dt, utc=False):
         if utc:
-            return calendar.timegm(dt.utctimetuple())
-        return time.mktime(dt.timetuple())
+            return (calendar.timegm(dt.utctimetuple()) +
+                    (dt.microsecond * 1e-6))
+        return time.mktime(dt.timetuple()) + (dt.microsecond * 1e-6)
 else:
     string_type = (bytes, str)
     text_type = str
     def to_timestamp(dt, utc=False):
         if utc:
-            return calendar.timegm(dt.utctimetuple())
+            return (calendar.timegm(dt.utctimetuple()) +
+                    (dt.microsecond * 1e-6))
         return dt.timestamp()
 
 

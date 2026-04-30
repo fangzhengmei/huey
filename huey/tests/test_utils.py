@@ -100,6 +100,10 @@ class TestToTimestampUTC(unittest.TestCase):
 
         self.assertEqual(ts_utc, expected_utc)
 
+        dt_utc = datetime.datetime.fromtimestamp(ts_utc, datetime.timezone.utc)
+        dt_utc_naive = dt_utc.replace(tzinfo=None)
+        self.assertEqual(dt_utc_naive, dt)
+
     def test_to_timestamp_local_mode_backward_compatible(self):
         dt = datetime.datetime(2023, 6, 15, 12, 0, 0, 123456)
 
@@ -109,7 +113,17 @@ class TestToTimestampUTC(unittest.TestCase):
         self.assertEqual(ts_local, ts_default)
         self.assertEqual(ts_local, dt.timestamp())
 
-    def test_to_timestamp_utc_vs_local_differs_in_non_utc_timezone(self):
+    def test_to_timestamp_utc_mode_correctly_interprets_naive_datetime_as_utc(self):
+        dt = datetime.datetime(2023, 6, 15, 12, 0, 0, 123456)
+
+        ts_utc = to_timestamp(dt, utc=True)
+
+        dt_reconstructed = datetime.datetime.fromtimestamp(ts_utc, datetime.timezone.utc)
+        dt_reconstructed_naive = dt_reconstructed.replace(tzinfo=None)
+
+        self.assertEqual(dt_reconstructed_naive, dt)
+
+    def test_to_timestamp_utc_vs_local_semantic_difference(self):
         dt = datetime.datetime(2023, 6, 15, 12, 0, 0)
 
         ts_utc = to_timestamp(dt, utc=True)
@@ -118,8 +132,14 @@ class TestToTimestampUTC(unittest.TestCase):
         expected_utc = calendar.timegm(dt.utctimetuple())
         self.assertEqual(ts_utc, expected_utc)
 
+        dt_from_utc = datetime.datetime.fromtimestamp(ts_utc, datetime.timezone.utc)
+        dt_from_local = datetime.datetime.fromtimestamp(ts_local, datetime.timezone.utc)
+
+        self.assertEqual(dt_from_utc.replace(tzinfo=None), dt)
+
         if time.timezone != 0 or time.daylight:
             self.assertNotEqual(ts_utc, ts_local)
+            self.assertNotEqual(dt_from_utc, dt_from_local)
 
 
 class TestToTimestampDSTBoundary(unittest.TestCase):
@@ -140,6 +160,13 @@ class TestToTimestampDSTBoundary(unittest.TestCase):
         actual_diff = ts_after_utc - ts_before_utc
         self.assertEqual(actual_diff, expected_diff)
 
+        dt_before_reconstructed = datetime.datetime.fromtimestamp(
+            ts_before_utc, datetime.timezone.utc).replace(tzinfo=None)
+        dt_after_reconstructed = datetime.datetime.fromtimestamp(
+            ts_after_utc, datetime.timezone.utc).replace(tzinfo=None)
+        self.assertEqual(dt_before_reconstructed, dt_before)
+        self.assertEqual(dt_after_reconstructed, dt_after)
+
     def test_dst_fall_back_boundary(self):
         dt_before = datetime.datetime(2023, 11, 5, 0, 30, 0)
         dt_after = datetime.datetime(2023, 11, 5, 2, 30, 0)
@@ -157,6 +184,13 @@ class TestToTimestampDSTBoundary(unittest.TestCase):
         actual_diff = ts_after_utc - ts_before_utc
         self.assertEqual(actual_diff, expected_diff)
 
+        dt_before_reconstructed = datetime.datetime.fromtimestamp(
+            ts_before_utc, datetime.timezone.utc).replace(tzinfo=None)
+        dt_after_reconstructed = datetime.datetime.fromtimestamp(
+            ts_after_utc, datetime.timezone.utc).replace(tzinfo=None)
+        self.assertEqual(dt_before_reconstructed, dt_before)
+        self.assertEqual(dt_after_reconstructed, dt_after)
+
     def test_utc_mode_consistent_throughout_year(self):
         test_dates = [
             datetime.datetime(2023, 1, 1, 12, 0, 0),
@@ -170,3 +204,7 @@ class TestToTimestampDSTBoundary(unittest.TestCase):
             ts_utc = to_timestamp(dt, utc=True)
             expected = calendar.timegm(dt.utctimetuple())
             self.assertEqual(ts_utc, expected)
+
+            dt_reconstructed = datetime.datetime.fromtimestamp(
+                ts_utc, datetime.timezone.utc).replace(tzinfo=None)
+            self.assertEqual(dt_reconstructed, dt)

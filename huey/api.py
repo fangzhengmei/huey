@@ -594,7 +594,7 @@ class Huey(object):
         if timestamp is None:
             timestamp = self._get_timestamp()
         return [self.deserialize_task(task)
-                for task in self.storage.read_schedule(timestamp)]
+                for task in self.storage.read_schedule(timestamp, self.utc)]
 
     def read_periodic(self, timestamp):
         if timestamp is None:

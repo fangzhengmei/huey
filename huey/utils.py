@@ -115,12 +115,16 @@ def normalize_time(eta=None, delay=None, utc=True):
 if sys.version_info[0] == 2:
     string_type = basestring
     text_type = unicode
-    def to_timestamp(dt):
+    def to_timestamp(dt, utc=False):
+        if utc:
+            return calendar.timegm(dt.utctimetuple())
         return time.mktime(dt.timetuple())
 else:
     string_type = (bytes, str)
     text_type = str
-    def to_timestamp(dt):
+    def to_timestamp(dt, utc=False):
+        if utc:
+            return calendar.timegm(dt.utctimetuple())
         return dt.timestamp()
 
 

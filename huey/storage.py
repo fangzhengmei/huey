@@ -1,5 +1,6 @@
 from collections import deque
 import base64
+import calendar
 import contextlib
 import hashlib
 import heapq
@@ -112,13 +113,14 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
-    def read_schedule(self, ts):
+    def read_schedule(self, ts, utc=False):
         """
         Read all tasks from the schedule that should be executed at or before
         the given timestamp. Once read, the tasks are removed from the
         schedule.
 
         :param datetime ts: Timestamp
+        :param bool utc: Whether huey is in UTC-mode or local mode.
         :return: List containing task data for tasks which should be executed
                  at or before the given timestamp.
         """
@@ -248,7 +250,7 @@ class BlackHoleStorage(BaseStorage):
     def enqueued_items(self, limit=None): return []
     def flush_queue(self): pass
     def add_to_schedule(self, data, ts, utc): pass
-    def read_schedule(self, ts): return []
+    def read_schedule(self, ts, utc=False): return []
     def schedule_size(self): return 0
     def scheduled_items(self, limit=None): return []
     def flush_schedule(self): pass
@@ -299,7 +301,7 @@ class MemoryStorage(BaseStorage):
     def add_to_schedule(self, data, ts, utc):
         heapq.heappush(self._schedule, (ts, data))
 
-    def read_schedule(self, ts):
+    def read_schedule(self, ts, utc=False):
         with self._lock:
             accum = []
             while self._schedule:
@@ -406,7 +408,10 @@ class RedisStorage(BaseStorage):
     def clean_name(self, name):
         return re.sub('[^a-z0-9]', '', name)
 
-    def convert_ts(self, ts):
+    def convert_ts(self, ts, utc=False):
+        if utc:
+            return (calendar.timegm(ts.utctimetuple()) +
+                    (ts.microsecond * 1e-6))
         return time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
 
     def enqueue(self, data, priority=None):
@@ -439,10 +444,10 @@ class RedisStorage(BaseStorage):
         self.conn.delete(self.queue_key)
 
     def add_to_schedule(self, data, ts, utc):
-        self.conn.zadd(self.schedule_key, {data: self.convert_ts(ts)})
+        self.conn.zadd(self.schedule_key, {data: self.convert_ts(ts, utc)})
 
-    def read_schedule(self, ts):
-        unix_ts = self.convert_ts(ts)
+    def read_schedule(self, ts, utc=False):
+        unix_ts = self.convert_ts(ts, utc)
         # invoke the redis lua script that will atomically pop off
         # all the tasks older than the given timestamp
         tasks = self._pop(keys=[self.schedule_key], args=[unix_ts])
@@ -754,13 +759,13 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from task where queue=?', (self.name,), commit=True)
 
     def add_to_schedule(self, data, ts, utc):
-        params = (self.name, to_blob(data), to_timestamp(ts))
+        params = (self.name, to_blob(data), to_timestamp(ts, utc))
         self.sql('insert into schedule (queue, data, timestamp) '
                  'values (?, ?, ?)', params, commit=True)
 
-    def read_schedule(self, ts):
+    def read_schedule(self, ts, utc=False):
         with self.db(commit=True) as curs:
-            params = (self.name, to_timestamp(ts))
+            params = (self.name, to_timestamp(ts, utc))
             curs.execute('select id, data from schedule where '
                          'queue = ? and timestamp <= ?', params)
             id_list, data = [], []
@@ -933,8 +938,12 @@ class FileStorage(BaseStorage):
     def flush_queue(self):
         self._flush_dir(self.queue_path)
 
-    def _timestamp_to_prefix(self, ts):
-        ts = time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
+    def _timestamp_to_prefix(self, ts, utc=False):
+        if utc:
+            ts = (calendar.timegm(ts.utctimetuple()) +
+                  (ts.microsecond * 1e-6))
+        else:
+            ts = time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
         return '%012x' % int(ts * 1000)
 
     def add_to_schedule(self, data, ts, utc):
@@ -942,7 +951,7 @@ class FileStorage(BaseStorage):
             if not os.path.exists(self.schedule_path):
                 os.makedirs(self.schedule_path)
 
-            ts_prefix = self._timestamp_to_prefix(ts)
+            ts_prefix = self._timestamp_to_prefix(ts, utc)
             base = filename = os.path.join(self.schedule_path, ts_prefix)
             conflict = 0
             while os.path.exists(filename):
@@ -952,9 +961,9 @@ class FileStorage(BaseStorage):
             with open(filename, 'wb') as fh:
                 fh.write(data)
 
-    def read_schedule(self, ts):
+    def read_schedule(self, ts, utc=False):
         with self.lock:
-            prefix = self._timestamp_to_prefix(ts)
+            prefix = self._timestamp_to_prefix(ts, utc)
             accum = []
             for basename in self._get_sorted_filenames(self.schedule_path):
                 if basename[:12] > prefix:

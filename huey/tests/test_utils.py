@@ -1,3 +1,4 @@
+import calendar
 import datetime
 import os
 import time
@@ -6,6 +7,7 @@ import unittest
 from huey.utils import UTC
 from huey.utils import normalize_time
 from huey.utils import reraise_as
+from huey.utils import to_timestamp
 
 
 class MyException(Exception): pass
@@ -87,3 +89,84 @@ class TestNormalizeTime(unittest.TestCase):
 
         # When utc=True there's no change, since the timestamp is already UTC.
         self.assertEqual(normalize_time(ts, utc=True), ts_local)
+
+
+class TestToTimestampUTC(unittest.TestCase):
+    def test_to_timestamp_utc_mode_returns_correct_utc_timestamp(self):
+        dt = datetime.datetime(2023, 6, 15, 12, 0, 0, 123456)
+
+        ts_utc = to_timestamp(dt, utc=True)
+        expected_utc = calendar.timegm(dt.utctimetuple()) + (dt.microsecond * 1e-6)
+
+        self.assertEqual(ts_utc, expected_utc)
+
+    def test_to_timestamp_local_mode_backward_compatible(self):
+        dt = datetime.datetime(2023, 6, 15, 12, 0, 0, 123456)
+
+        ts_local = to_timestamp(dt, utc=False)
+        ts_default = to_timestamp(dt)
+
+        self.assertEqual(ts_local, ts_default)
+        self.assertEqual(ts_local, dt.timestamp())
+
+    def test_to_timestamp_utc_vs_local_differs_in_non_utc_timezone(self):
+        dt = datetime.datetime(2023, 6, 15, 12, 0, 0)
+
+        ts_utc = to_timestamp(dt, utc=True)
+        ts_local = to_timestamp(dt, utc=False)
+
+        expected_utc = calendar.timegm(dt.utctimetuple())
+        self.assertEqual(ts_utc, expected_utc)
+
+        if time.timezone != 0 or time.daylight:
+            self.assertNotEqual(ts_utc, ts_local)
+
+
+class TestToTimestampDSTBoundary(unittest.TestCase):
+    def test_dst_spring_forward_boundary(self):
+        dt_before = datetime.datetime(2023, 3, 12, 1, 30, 0)
+        dt_after = datetime.datetime(2023, 3, 12, 3, 30, 0)
+
+        ts_before_utc = to_timestamp(dt_before, utc=True)
+        ts_after_utc = to_timestamp(dt_after, utc=True)
+
+        expected_before = calendar.timegm(dt_before.utctimetuple())
+        expected_after = calendar.timegm(dt_after.utctimetuple())
+
+        self.assertEqual(ts_before_utc, expected_before)
+        self.assertEqual(ts_after_utc, expected_after)
+
+        expected_diff = (dt_after - dt_before).total_seconds()
+        actual_diff = ts_after_utc - ts_before_utc
+        self.assertEqual(actual_diff, expected_diff)
+
+    def test_dst_fall_back_boundary(self):
+        dt_before = datetime.datetime(2023, 11, 5, 0, 30, 0)
+        dt_after = datetime.datetime(2023, 11, 5, 2, 30, 0)
+
+        ts_before_utc = to_timestamp(dt_before, utc=True)
+        ts_after_utc = to_timestamp(dt_after, utc=True)
+
+        expected_before = calendar.timegm(dt_before.utctimetuple())
+        expected_after = calendar.timegm(dt_after.utctimetuple())
+
+        self.assertEqual(ts_before_utc, expected_before)
+        self.assertEqual(ts_after_utc, expected_after)
+
+        expected_diff = (dt_after - dt_before).total_seconds()
+        actual_diff = ts_after_utc - ts_before_utc
+        self.assertEqual(actual_diff, expected_diff)
+
+    def test_utc_mode_consistent_throughout_year(self):
+        test_dates = [
+            datetime.datetime(2023, 1, 1, 12, 0, 0),
+            datetime.datetime(2023, 3, 12, 2, 0, 0),
+            datetime.datetime(2023, 6, 21, 12, 0, 0),
+            datetime.datetime(2023, 11, 5, 2, 0, 0),
+            datetime.datetime(2023, 12, 25, 12, 0, 0),
+        ]
+
+        for dt in test_dates:
+            ts_utc = to_timestamp(dt, utc=True)
+            expected = calendar.timegm(dt.utctimetuple())
+            self.assertEqual(ts_utc, expected)

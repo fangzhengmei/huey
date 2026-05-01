@@ -8,6 +8,7 @@ from huey.api import Huey
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import BaseStorage
+from huey.storage import ResultStoreMixin
 
 
 class BytesBlobField(BlobField):
@@ -15,9 +16,12 @@ class BytesBlobField(BlobField):
         return value if isinstance(value, bytes) else bytes(value)
 
 
-class SqlStorage(BaseStorage):
-    def __init__(self, name='huey', database=None, **kwargs):
-        super(SqlStorage, self).__init__(name)
+class SqlStorage(ResultStoreMixin, BaseStorage):
+    def __init__(self, name='huey', database=None, expire_time=None, **kwargs):
+        if expire_time is not None:
+            super(SqlStorage, self).__init__(name, expire_time=expire_time)
+        else:
+            super(SqlStorage, self).__init__(name)
 
         if database is None:
             raise ConfigurationError('Use of SqlStorage requires a '
@@ -27,25 +31,20 @@ class SqlStorage(BaseStorage):
         if isinstance(database, Database):
             self.database = database
         else:
-            # Treat database argument as a URL connection string.
             self.database = db_url_connect(database)
 
         self.KV, self.Schedule, self.Task, self.Counter = self.create_models()
         self.create_tables()
 
-        # Check for FOR UPDATE SKIP LOCKED support.
         if isinstance(self.database, PostgresqlDatabase):
             self.for_update = 'FOR UPDATE SKIP LOCKED'
         elif isinstance(self.database, MySQLDatabase):
-            self.for_update = 'FOR UPDATE SKIP LOCKED'  # Assume support.
-            # Try to determine if we're using MariaDB or MySQL.
+            self.for_update = 'FOR UPDATE SKIP LOCKED'
             version, = self.database.execute_sql('select version()').fetchone()
             if 'mariadb' in str(version).lower():
-                # MariaDB added support in 10.6.0.
                 if self.database.server_version < (10, 6):
                     self.for_update = 'FOR UPDATE'
             elif self.database.server_version < (8, 0, 1):
-                # MySQL added support in 8.0.1.
                 self.for_update = 'FOR UPDATE'
         else:
             self.for_update = None
@@ -59,6 +58,7 @@ class SqlStorage(BaseStorage):
             queue = CharField()
             key = CharField()
             value = BytesBlobField()
+            expire_time = DoubleField(null=True)
             class Meta:
                 primary_key = CompositeKey('queue', 'key')
 
@@ -80,6 +80,7 @@ class SqlStorage(BaseStorage):
             queue = CharField()
             key = CharField()
             value = IntegerField()
+            expire_time = DoubleField(null=True)
             class Meta:
                 primary_key = CompositeKey('queue', 'key')
 
@@ -190,80 +191,168 @@ class SqlStorage(BaseStorage):
          .where(self.Schedule.queue == self.name)
          .execute())
 
+    def _clean_expired(self):
+        """Lazy cleanup of expired items."""
+        self.check_conn()
+        now = self._get_now_ts()
+        (self.KV
+         .delete()
+         .where(
+             (self.KV.queue == self.name) &
+             (self.KV.expire_time.is_null(False)) &
+             (self.KV.expire_time < now))
+         .execute())
+
     def put_data(self, key, value, is_result=False):
         self.check_conn()
+        expire_ts = self._calculate_expire_ts(is_result)
         if isinstance(self.database, PostgresqlDatabase):
             (self.KV
-             .insert(queue=self.name, key=key, value=value)
-             .on_conflict(conflict_target=[self.KV.queue, self.KV.key],
-                          preserve=[self.KV.value])
+             .insert(queue=self.name, key=key, value=value, expire_time=expire_ts)
+             .on_conflict(
+                 conflict_target=[self.KV.queue, self.KV.key],
+                 preserve=[self.KV.value, self.KV.expire_time])
              .execute())
         else:
-            self.KV.replace(queue=self.name, key=key, value=value).execute()
+            (self.KV
+             .replace(queue=self.name, key=key, value=value, expire_time=expire_ts)
+             .execute())
 
     def peek_data(self, key):
         self.check_conn()
         try:
-            kv = self.kv(self.KV.value).where(self.KV.key == key).get()
+            kv = (self.kv(self.KV.value, self.KV.expire_time)
+                  .where(self.KV.key == key).get())
         except self.KV.DoesNotExist:
             return EmptyData
         else:
+            if self._is_expired(kv.expire_time):
+                (self.KV
+                 .delete()
+                 .where(
+                     (self.KV.queue == self.name) &
+                     (self.KV.key == key))
+                 .execute())
+                return EmptyData
             return kv.value
 
     def pop_data(self, key):
-        self.check_conn()
-        query = self.kv().where(self.KV.key == key)
-        if self.for_update:
-            query = query.for_update(self.for_update)
+        if self._should_destructive_read():
+            self.check_conn()
+            query = self.kv(self.KV.value, self.KV.expire_time).where(self.KV.key == key)
+            if self.for_update:
+                query = query.for_update(self.for_update)
 
-        with self.database.atomic():
-            try:
-                kv = query.get()
-            except self.KV.DoesNotExist:
-                return EmptyData
-            else:
-                dq = self.KV.delete().where(
-                    (self.KV.queue == self.name) &
-                    (self.KV.key == key))
-                return kv.value if dq.execute() == 1 else EmptyData
+            with self.database.atomic():
+                try:
+                    kv = query.get()
+                except self.KV.DoesNotExist:
+                    return EmptyData
+                else:
+                    if self._is_expired(kv.expire_time):
+                        (self.KV
+                         .delete()
+                         .where(
+                             (self.KV.queue == self.name) &
+                             (self.KV.key == key))
+                         .execute())
+                        return EmptyData
+                    (self.KV
+                     .delete()
+                     .where(
+                         (self.KV.queue == self.name) &
+                         (self.KV.key == key))
+                     .execute())
+                    return kv.value
+        else:
+            return self.peek_data(key)
 
     def has_data_for_key(self, key):
         self.check_conn()
-        return self.kv().where(self.KV.key == key).exists()
+        try:
+            kv = (self.kv(self.KV.expire_time)
+                  .where(self.KV.key == key).get())
+        except self.KV.DoesNotExist:
+            return False
+        else:
+            if self._is_expired(kv.expire_time):
+                (self.KV
+                 .delete()
+                 .where(
+                     (self.KV.queue == self.name) &
+                     (self.KV.key == key))
+                 .execute())
+                return False
+            return True
 
     def put_if_empty(self, key, value):
         self.check_conn()
         try:
             with self.database.atomic():
-                self.KV.insert(queue=self.name, key=key, value=value).execute()
+                if self.has_data_for_key(key):
+                    return False
+                (self.KV
+                 .insert(queue=self.name, key=key, value=value, expire_time=None)
+                 .execute())
         except IntegrityError:
             return False
         else:
             return True
 
+    def delete_data(self, key):
+        self.check_conn()
+        nrows = (self.KV
+                 .delete()
+                 .where(
+                     (self.KV.queue == self.name) &
+                     (self.KV.key == key))
+                 .execute())
+        return nrows == 1
+
     def incr(self, key, amount=1):
+        self.check_conn()
         with self.database.atomic():
-            if isinstance(self.database, MySQLDatabase):
-                self._incr_mysql(key, amount)
+            try:
+                counter = (self.Counter
+                           .select(self.Counter.value, self.Counter.expire_time)
+                           .where(
+                               (self.Counter.queue == self.name) &
+                               (self.Counter.key == key))
+                           .get())
+                if self._is_expired(counter.expire_time):
+                    val = 0
+                else:
+                    val = counter.value
+            except self.Counter.DoesNotExist:
+                val = 0
+
+            new_val = val + amount
+            if self._expire_time is not None:
+                expire_ts = self._get_now_ts() + self._expire_time
             else:
-                self._incr(key, amount)
+                expire_ts = None
 
-            return self.Counter.get(
-                (self.Counter.queue == self.name) &
-                (self.Counter.key == key)).value
+            if isinstance(self.database, MySQLDatabase):
+                self._incr_mysql(key, new_val, expire_ts)
+            else:
+                self._incr(key, new_val, expire_ts)
 
-    def _incr_mysql(self, key, amount=1):
+            return new_val
+
+    def _incr_mysql(self, key, val, expire_ts):
         (self.Counter
-         .insert(queue=self.name, key=key, value=amount)
-         .on_conflict(update={self.Counter.value: self.Counter.value + amount})
+         .insert(queue=self.name, key=key, value=val, expire_time=expire_ts)
+         .on_conflict(update={
+             self.Counter.value: val,
+             self.Counter.expire_time: expire_ts})
          .execute())
 
-    def _incr(self, key, amount=1):
+    def _incr(self, key, val, expire_ts):
         (self.Counter
-         .insert(queue=self.name, key=key, value=amount)
+         .insert(queue=self.name, key=key, value=val, expire_time=expire_ts)
          .on_conflict(
              conflict_target=(self.Counter.queue, self.Counter.key),
-             update={self.Counter.value: self.Counter.value + amount})
+             update={self.Counter.value: val, self.Counter.expire_time: expire_ts})
          .execute())
 
     def delete_counter(self, key):
@@ -273,9 +362,11 @@ class SqlStorage(BaseStorage):
                 (self.Counter.key == key)).execute()
 
     def result_store_size(self):
+        self._clean_expired()
         return self.kv().count()
 
     def result_items(self):
+        self._clean_expired()
         query = self.kv(self.KV.key, self.KV.value).tuples()
         return dict((k, v) for k, v in query.iterator())
 

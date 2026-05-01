@@ -709,10 +709,10 @@ class Huey(object):
         return is_revoked
 
     def add_schedule(self, task):
+        task.timeline['scheduled_at'] = self._get_timestamp()
         data = self.serialize_task(task)
         eta = task.eta or datetime.datetime.fromtimestamp(0)
         self.storage.add_to_schedule(data, eta)
-        task.timeline['scheduled_at'] = self._get_timestamp()
         logger.info('Added task %s to schedule, eta %s', task.id, eta)
         self._emit(S.SIGNAL_SCHEDULED, task)
 
@@ -817,7 +817,7 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None):
+                 timeout=None, chord_config=None, timeline=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -837,7 +837,7 @@ class Task(object):
 
         self.on_complete = on_complete
         self.on_error = on_error
-        self.timeline = {}
+        self.timeline = timeline if timeline is not None else {}
 
     @property
     def data(self):

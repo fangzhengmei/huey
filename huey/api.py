@@ -15,6 +15,7 @@ from functools import wraps
 
 from huey import signals as S
 from huey.constants import EmptyData
+from huey.constants import TaskStatus
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
@@ -433,6 +434,7 @@ class Huey(object):
                 self._run_pre_execute(task)
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
+                self.set_progress(task, status=TaskStatus.CANCELED)
                 return
 
         start = time.monotonic()
@@ -440,9 +442,14 @@ class Huey(object):
         retry_eta = None
         task_value = None
 
+        self.set_progress(task, status=TaskStatus.RUNNING)
+
         # Set deadline for cooperative timeout.
         if task.timeout:
             task._deadline = start + task.timeout
+
+        # Set huey reference for task to allow progress updates.
+        task._huey = self
 
         try:
             self._tasks_in_flight.add(task)
@@ -452,6 +459,8 @@ class Huey(object):
             finally:
                 self._tasks_in_flight.remove(task)
                 duration = time.monotonic() - start
+                # Clear huey reference after execution.
+                task._huey = None
         except TaskTimeout as exc:
             logger.warning('Task %s timed out after %ss.', task.id,
                            task.timeout)
@@ -499,6 +508,7 @@ class Huey(object):
             self._emit(S.SIGNAL_ERROR, task, exc)
         else:
             logger.info('%s executed in %0.3fs', task, duration)
+            self.set_progress(task, progress=100, status=TaskStatus.COMPLETED)
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing by destructively reading it's revoke key.
@@ -509,6 +519,8 @@ class Huey(object):
             if exception is not None:
                 error_data = self.build_error_result(task, exception)
                 self.put_result(task.id, Error(error_data))
+                if not task.retries:
+                    self.set_progress(task, status=TaskStatus.FAILED)
             elif task_value is not None or self.store_none:
                 self.put_result(task.id, task_value)
 
@@ -776,6 +788,58 @@ class Huey(object):
     def rate_limit(self, name, limit, per, retry=True):
         return RateLimit(self, name, limit, per, retry=retry)
 
+    def _progress_key(self, task_id):
+        return 'p:%s' % task_id
+
+    def set_progress(self, task_id, progress=None, stage=None, status=None):
+        if isinstance(task_id, Task):
+            task_id = task_id.id
+        elif isinstance(task_id, Result):
+            task_id = task_id.id
+        
+        key = self._progress_key(task_id)
+        current_progress = self.get_progress(task_id) or {}
+        
+        if progress is not None:
+            if not isinstance(progress, (int, float)):
+                raise ValueError('progress must be a number')
+            progress = max(0, min(100, progress))
+            current_progress['progress'] = progress
+        
+        if stage is not None:
+            current_progress['stage'] = stage
+        
+        if status is not None:
+            current_progress['status'] = status
+        
+        if 'progress' not in current_progress:
+            current_progress['progress'] = 0
+        if 'stage' not in current_progress:
+            current_progress['stage'] = ''
+        if 'status' not in current_progress:
+            current_progress['status'] = TaskStatus.PENDING
+        
+        self.put(key, current_progress)
+        return current_progress
+
+    def get_progress(self, task_id):
+        if isinstance(task_id, Task):
+            task_id = task_id.id
+        elif isinstance(task_id, Result):
+            task_id = task_id.id
+        
+        key = self._progress_key(task_id)
+        return self.get(key, peek=True)
+
+    def clear_progress(self, task_id):
+        if isinstance(task_id, Task):
+            task_id = task_id.id
+        elif isinstance(task_id, Result):
+            task_id = task_id.id
+        
+        key = self._progress_key(task_id)
+        return self.delete(key)
+
     def _result_handle(self, task):
         return Result(self, task)
 
@@ -911,6 +975,11 @@ class Task(object):
                 task = task.s(*args, **kwargs)
             self.on_error = task
         return self
+
+    def set_progress(self, progress=None, stage=None):
+        if hasattr(self, '_huey') and self._huey is not None:
+            return self._huey.set_progress(self, progress=progress, stage=stage)
+        return None
 
     def execute(self):
         # Implementation provided by subclass, see: TaskWrapper.create_task().
@@ -1292,6 +1361,9 @@ class Result(object):
 
     def reset(self):
         self._result = EmptyData
+
+    def get_progress(self):
+        return self.huey.get_progress(self)
 
 
 class ResultGroup(object):

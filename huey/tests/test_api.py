@@ -13,6 +13,7 @@ from huey.api import chord
 from huey.api import crontab
 from huey.api import group
 from huey.constants import EmptyData
+from huey.constants import TaskStatus
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
@@ -2615,3 +2616,155 @@ class TestCustomErrorMetadata(BaseTestCase):
 
         self.assertEqual(self.huey.result_count(), 0)
         self.assertEqual(len(self.huey), 0)
+
+
+class TestTaskProgress(BaseTestCase):
+    def test_progress_status_auto_update(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        r = task_a(3)
+        
+        progress = r.get_progress()
+        self.assertEqual(progress, None)
+        
+        self.assertEqual(self.execute_next(), 4)
+        
+        progress = r.get_progress()
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress['status'], TaskStatus.COMPLETED)
+        self.assertEqual(progress['progress'], 100)
+
+    def test_progress_manual_update_during_execution(self):
+        progress_state = []
+        
+        @self.huey.task(context=True)
+        def long_task(task=None):
+            task.set_progress(progress=25, stage='Initializing')
+            progress_state.append(task.set_progress(progress=50, stage='Processing'))
+            task.set_progress(progress=75, stage='Finalizing')
+            return 'done'
+
+        r = long_task()
+        
+        task = self.huey.dequeue()
+        self.huey.execute(task)
+        
+        self.assertEqual(r(), 'done')
+        
+        self.assertEqual(len(progress_state), 1)
+        self.assertEqual(progress_state[0]['progress'], 50)
+        self.assertEqual(progress_state[0]['stage'], 'Processing')
+        
+        progress = r.get_progress()
+        self.assertEqual(progress['status'], TaskStatus.COMPLETED)
+        self.assertEqual(progress['progress'], 100)
+
+    def test_progress_status_failed(self):
+        @self.huey.task()
+        def task_failed():
+            raise TestError('something went wrong')
+
+        r = task_failed()
+        self.assertTrue(self.execute_next() is None)
+        
+        progress = r.get_progress()
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress['status'], TaskStatus.FAILED)
+
+    def test_progress_status_canceled(self):
+        @self.huey.pre_execute()
+        def cancel_task(task):
+            raise CancelExecution()
+
+        @self.huey.task()
+        def task_canceled():
+            return 'should not run'
+
+        r = task_canceled()
+        self.assertTrue(self.execute_next() is None)
+        
+        progress = r.get_progress()
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress['status'], TaskStatus.CANCELED)
+
+    def test_progress_with_retry(self):
+        attempts = []
+        
+        @self.huey.task(retries=1)
+        def task_with_retry():
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise TestError('first attempt fails')
+            return 'success'
+
+        r = task_with_retry()
+        
+        self.assertTrue(self.execute_next() is None)
+        
+        progress = r.get_progress()
+        self.assertEqual(progress['status'], TaskStatus.RUNNING)
+        
+        self.assertEqual(self.execute_next(), 'success')
+        
+        progress = r.get_progress()
+        self.assertEqual(progress['status'], TaskStatus.COMPLETED)
+        self.assertEqual(progress['progress'], 100)
+
+    def test_huey_set_progress_directly(self):
+        @self.huey.task()
+        def simple_task():
+            return 'done'
+
+        r = simple_task()
+        
+        self.huey.set_progress(r, progress=50, stage='Halfway there')
+        progress = r.get_progress()
+        self.assertEqual(progress['progress'], 50)
+        self.assertEqual(progress['stage'], 'Halfway there')
+        self.assertEqual(progress['status'], TaskStatus.PENDING)
+        
+        self.assertEqual(self.execute_next(), 'done')
+        
+        progress = r.get_progress()
+        self.assertEqual(progress['status'], TaskStatus.COMPLETED)
+        self.assertEqual(progress['progress'], 100)
+
+    def test_clear_progress(self):
+        @self.huey.task()
+        def simple_task():
+            return 'done'
+
+        r = simple_task()
+        
+        self.huey.set_progress(r, progress=50)
+        self.assertIsNotNone(r.get_progress())
+        
+        self.huey.clear_progress(r)
+        self.assertIsNone(r.get_progress())
+
+    def test_progress_validation(self):
+        @self.huey.task()
+        def simple_task():
+            return 'done'
+
+        r = simple_task()
+        
+        self.huey.set_progress(r, progress=150)
+        progress = r.get_progress()
+        self.assertEqual(progress['progress'], 100)
+        
+        self.huey.set_progress(r, progress=-50)
+        progress = r.get_progress()
+        self.assertEqual(progress['progress'], 0)
+
+    def test_task_set_progress_outside_execution(self):
+        @self.huey.task(context=True)
+        def task_with_context(task=None):
+            return 'done'
+
+        task = task_with_context.s()
+        
+        result = task.set_progress(progress=50)
+        self.assertIsNone(result)

@@ -1153,9 +1153,10 @@ class SqliteStorage(ResultStoreMixin, BaseSqlStorage):
                  (self.name, key), commit=True)
 
     def delete_data(self, key):
-        self.sql('delete from kv where queue = ? and key = ?',
-                 (self.name, key), commit=True)
-        return True
+        with self.db(commit=True) as curs:
+            curs.execute('delete from kv where queue = ? and key = ?',
+                         (self.name, key))
+            return curs.rowcount == 1
 
     def result_store_size(self):
         self._clean_expired()

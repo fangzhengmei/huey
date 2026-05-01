@@ -99,20 +99,10 @@ class Worker(BaseProcess):
         super(Worker, self).__init__(huey)
 
     def initialize(self):
-        for name, startup_hook in self.huey._startup.items():
-            self._logger.debug('calling startup hook "%s"', name)
-            try:
-                startup_hook()
-            except Exception as exc:
-                self._logger.exception('startup hook "%s" failed', name)
+        self.huey._signal_dispatcher.execute_startup_hooks()
 
     def shutdown(self):
-        for name, shutdown_hook in self.huey._shutdown.items():
-            self._logger.debug('calling shutdown hook "%s"', name)
-            try:
-                shutdown_hook()
-            except Exception as exc:
-                self._logger.exception('shutdown hook "%s" failed', name)
+        self.huey._signal_dispatcher.execute_shutdown_hooks()
 
     def loop(self, now=None):
         task = None

@@ -14,6 +14,11 @@ from functools import partial
 from functools import wraps
 
 from huey import signals as S
+from huey.signals import SIGNAL_PRE_EXECUTE
+from huey.signals import SIGNAL_POST_EXECUTE
+from huey.signals import SIGNAL_STARTUP
+from huey.signals import SIGNAL_SHUTDOWN
+from huey.signals import SignalDispatcher
 from huey.constants import EmptyData
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
@@ -109,12 +114,9 @@ class Huey(object):
         self.task_wrapper_class = self.get_task_wrapper_class()
 
         self._locks = set()
-        self._pre_execute = OrderedDict()
-        self._post_execute = OrderedDict()
-        self._startup = OrderedDict()
-        self._shutdown = OrderedDict()
         self._registry = Registry()
-        self._signal = S.Signal()
+        self._signal_dispatcher = SignalDispatcher()
+        self._signal_dispatcher.set_logger(logger)
         self._tasks_in_flight = set()
         self._timeout_handler = None  # This is consumer-specific.
 
@@ -220,51 +222,59 @@ class Huey(object):
 
     def pre_execute(self, name=None):
         def decorator(fn):
-            self._pre_execute[name or fn.__name__] = fn
+            self._signal_dispatcher.register_hook(
+                SIGNAL_PRE_EXECUTE,
+                name or fn.__name__,
+                fn)
             return fn
         return decorator
 
     def unregister_pre_execute(self, name):
         if not isinstance(name, str):
-            # Assume we were given the function itself.
             name = name.__name__
-        return self._pre_execute.pop(name, None) is not None
+        return self._signal_dispatcher.unregister_hook(SIGNAL_PRE_EXECUTE, name)
 
     def post_execute(self, name=None):
         def decorator(fn):
-            self._post_execute[name or fn.__name__] = fn
+            self._signal_dispatcher.register_hook(
+                SIGNAL_POST_EXECUTE,
+                name or fn.__name__,
+                fn)
             return fn
         return decorator
 
     def unregister_post_execute(self, name):
         if not isinstance(name, str):
-            # Assume we were given the function itself.
             name = name.__name__
-        return self._post_execute.pop(name, None) is not None
+        return self._signal_dispatcher.unregister_hook(SIGNAL_POST_EXECUTE, name)
 
     def on_startup(self, name=None):
         def decorator(fn):
-            self._startup[name or fn.__name__] = fn
+            self._signal_dispatcher.register_hook(
+                SIGNAL_STARTUP,
+                name or fn.__name__,
+                fn)
             return fn
         return decorator
 
     def unregister_on_startup(self, name):
         if not isinstance(name, str):
-            # Assume we were given the function itself.
             name = name.__name__
-        return self._startup.pop(name, None) is not None
+        return self._signal_dispatcher.unregister_hook(SIGNAL_STARTUP, name)
 
     def on_shutdown(self, name=None):
         def decorator(fn):
-            self._shutdown[name or fn.__name__] = fn
+            self._signal_dispatcher.register_hook(
+                SIGNAL_SHUTDOWN,
+                name or fn.__name__,
+                fn)
             return fn
         return decorator
 
     def unregister_on_shutdown(self, name=None):
         if not isinstance(name, str):
-            # Assume we were given the function itself.
             name = name.__name__
-        return self._shutdown.pop(name, None) is not None
+        return self._signal_dispatcher.unregister_hook(SIGNAL_SHUTDOWN, name)
 
     def notify_interrupted_tasks(self):
         while self._tasks_in_flight:
@@ -273,18 +283,15 @@ class Huey(object):
 
     def signal(self, *signals):
         def decorator(fn):
-            self._signal.connect(fn, *signals)
+            self._signal_dispatcher.connect(fn, *signals)
             return fn
         return decorator
 
     def disconnect_signal(self, receiver, *signals):
-        self._signal.disconnect(receiver, *signals)
+        self._signal_dispatcher.disconnect(receiver, *signals)
 
     def _emit(self, signal, task, *args, **kwargs):
-        try:
-            self._signal.send(signal, task, *args, **kwargs)
-        except Exception as exc:
-            logger.exception('Error occurred sending signal "%s"', signal)
+        self._signal_dispatcher.emit(signal, task, *args, **kwargs)
 
     def serialize_task(self, task):
         message = self._registry.create_message(task)
@@ -428,12 +435,11 @@ class Huey(object):
             return self._execute(task, timestamp)
 
     def _execute(self, task, timestamp):
-        if self._pre_execute:
-            try:
-                self._run_pre_execute(task)
-            except CancelExecution:
-                self._emit(S.SIGNAL_CANCELED, task)
-                return
+        try:
+            self._signal_dispatcher.execute_pre_execute_hooks(task)
+        except CancelExecution:
+            self._emit(S.SIGNAL_CANCELED, task)
+            return
 
         start = time.monotonic()
         exception = None
@@ -512,8 +518,7 @@ class Huey(object):
             elif task_value is not None or self.store_none:
                 self.put_result(task.id, task_value)
 
-        if self._post_execute:
-            self._run_post_execute(task, task_value, exception)
+        self._signal_dispatcher.execute_post_execute_hooks(task, task_value, exception)
 
         if exception is None:
             # Task executed successfully, send the COMPLETE signal.
@@ -571,28 +576,6 @@ class Huey(object):
             self.add_schedule(task)
         else:
             self.enqueue(task)
-
-    def _run_pre_execute(self, task):
-        for name, callback in self._pre_execute.items():
-            logger.debug('Pre-execute hook %s for %s.', name, task)
-            try:
-                callback(task)
-            except CancelExecution:
-                logger.warning('Task %s cancelled by %s (pre-execute).',
-                               task, name)
-                raise
-            except Exception:
-                logger.exception('Unhandled exception calling pre-execute '
-                                 'hook %s for %s.', name, task)
-
-    def _run_post_execute(self, task, task_value, exception):
-        for name, callback in self._post_execute.items():
-            logger.debug('Post-execute hook %s for %s.', name, task)
-            try:
-                callback(task, task_value, exception)
-            except Exception as exc:
-                logger.exception('Unhandled exception calling post-execute '
-                                 'hook %s for %s.', name, task)
 
     def build_error_result(self, task, exception):
         try:

@@ -47,6 +47,45 @@ logger = logging.getLogger('huey')
 _sentinel = object()
 
 
+class RetryStrategy(object):
+    def __init__(self, retries=0, retry_delay=0, retry_backoff=1.0,
+                 max_retry_delay=None):
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
+        self.max_retry_delay = max_retry_delay
+
+    def calculate_delay(self, attempt=0):
+        if self.retry_delay <= 0:
+            return 0
+        
+        if self.retry_backoff == 1.0:
+            return self.retry_delay
+        
+        delay = self.retry_delay * (self.retry_backoff ** attempt)
+        
+        if self.max_retry_delay is not None and delay > self.max_retry_delay:
+            return self.max_retry_delay
+        
+        return delay
+
+    def __eq__(self, other):
+        if not isinstance(other, RetryStrategy):
+            return False
+        return (
+            self.retries == other.retries and
+            self.retry_delay == other.retry_delay and
+            self.retry_backoff == other.retry_backoff and
+            self.max_retry_delay == other.max_retry_delay
+        )
+
+    def __repr__(self):
+        return ('RetryStrategy(retries=%d, retry_delay=%s, '
+                'retry_backoff=%s, max_retry_delay=%s)' % (
+                    self.retries, self.retry_delay,
+                    self.retry_backoff, self.max_retry_delay))
+
+
 class Huey(object):
     """
     Huey executes tasks by exposing function decorators that cause the function
@@ -163,17 +202,32 @@ class Huey(object):
     def create_consumer(self, **options):
         return Consumer(self, **options)
 
-    def task(self, retries=0, retry_delay=0, priority=None, context=False,
-             name=None, expires=None, timeout=None, **kwargs):
+    def task(self, retries=0, retry_delay=0, retry_backoff=1.0,
+             max_retry_delay=None, priority=None, context=False,
+             name=None, expires=None, timeout=None, retry_strategy=None,
+             **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
+            if retry_strategy is not None:
+                r = retry_strategy.retries
+                rd = retry_strategy.retry_delay
+                rb = retry_strategy.retry_backoff
+                mrd = retry_strategy.max_retry_delay
+            else:
+                r = retries
+                rd = retry_delay
+                rb = retry_backoff
+                mrd = max_retry_delay
+            
             return TaskWrapper(
                 self,
                 func.func if isinstance(func, TaskWrapper) else func,
                 context=context,
                 name=name,
-                default_retries=retries,
-                default_retry_delay=retry_delay,
+                default_retries=r,
+                default_retry_delay=rd,
+                default_retry_backoff=rb,
+                default_max_retry_delay=mrd,
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
@@ -181,20 +235,34 @@ class Huey(object):
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
+                      retry_backoff=1.0, max_retry_delay=None,
                       priority=None, context=False, name=None, expires=None,
-                      timeout=None, **kwargs):
+                      timeout=None, retry_strategy=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
                 return validate_datetime(timestamp)
+            
+            if retry_strategy is not None:
+                r = retry_strategy.retries
+                rd = retry_strategy.retry_delay
+                rb = retry_strategy.retry_backoff
+                mrd = retry_strategy.max_retry_delay
+            else:
+                r = retries
+                rd = retry_delay
+                rb = retry_backoff
+                mrd = max_retry_delay
 
             return TaskWrapper(
                 self,
                 func.func if isinstance(func, TaskWrapper) else func,
                 context=context,
                 name=name,
-                default_retries=retries,
-                default_retry_delay=retry_delay,
+                default_retries=r,
+                default_retry_delay=rd,
+                default_retry_backoff=rb,
+                default_max_retry_delay=mrd,
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
@@ -566,7 +634,8 @@ class Huey(object):
             task.eta = retry_eta
             self.add_schedule(task)
         elif task.retry_delay:
-            delay = datetime.timedelta(seconds=task.retry_delay)
+            delay_seconds = task.retry_strategy.calculate_delay()
+            delay = datetime.timedelta(seconds=delay_seconds)
             task.eta = timestamp + delay
             self.add_schedule(task)
         else:
@@ -796,21 +865,35 @@ class Task(object):
     default_priority = None
     default_retries = 0
     default_retry_delay = 0
+    default_retry_backoff = 1.0
+    default_max_retry_delay = None
     default_timeout = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
-                 retry_delay=None, priority=None, expires=None,
-                 on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None):
+                 retry_delay=None, retry_backoff=None, max_retry_delay=None,
+                 priority=None, expires=None, on_complete=None, on_error=None,
+                 expires_resolved=None, timeout=None, chord_config=None,
+                 retry_strategy=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
         self.id = id or self.create_id()
         self.revoke_id = 'r:%s' % self.id
         self.eta = eta
-        self.retries = retries if retries is not None else self.default_retries
-        self.retry_delay = retry_delay if retry_delay is not None else \
-                self.default_retry_delay
+        
+        if retry_strategy is not None:
+            self._retry_strategy = RetryStrategy(
+                retries=retry_strategy.retries,
+                retry_delay=retry_strategy.retry_delay,
+                retry_backoff=retry_strategy.retry_backoff,
+                max_retry_delay=retry_strategy.max_retry_delay)
+        else:
+            r = retries if retries is not None else self.default_retries
+            rd = retry_delay if retry_delay is not None else self.default_retry_delay
+            rb = retry_backoff if retry_backoff is not None else self.default_retry_backoff
+            mrd = max_retry_delay if max_retry_delay is not None else self.default_max_retry_delay
+            self._retry_strategy = RetryStrategy(r, rd, rb, mrd)
+        
         self.priority = priority if priority is not None else \
                 self.default_priority
         self.expires = expires if expires is not None else self.default_expires
@@ -821,6 +904,42 @@ class Task(object):
 
         self.on_complete = on_complete
         self.on_error = on_error
+
+    @property
+    def retries(self):
+        return self._retry_strategy.retries
+
+    @retries.setter
+    def retries(self, value):
+        self._retry_strategy.retries = value
+
+    @property
+    def retry_delay(self):
+        return self._retry_strategy.retry_delay
+
+    @retry_delay.setter
+    def retry_delay(self, value):
+        self._retry_strategy.retry_delay = value
+
+    @property
+    def retry_backoff(self):
+        return self._retry_strategy.retry_backoff
+
+    @retry_backoff.setter
+    def retry_backoff(self, value):
+        self._retry_strategy.retry_backoff = value
+
+    @property
+    def max_retry_delay(self):
+        return self._retry_strategy.max_retry_delay
+
+    @max_retry_delay.setter
+    def max_retry_delay(self, value):
+        self._retry_strategy.max_retry_delay = value
+
+    @property
+    def retry_strategy(self):
+        return self._retry_strategy
 
     @property
     def data(self):
@@ -935,19 +1054,21 @@ class TaskWrapper(object):
     task_base = Task
 
     def __init__(self, huey, func, retries=None, retry_delay=None,
+                 retry_backoff=None, max_retry_delay=None,
                  context=False, name=None, task_base=None, **settings):
         self.__doc__ = getattr(func, '__doc__', None)
         self.huey = huey
         self.func = func
         self.retries = retries
         self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
+        self.max_retry_delay = max_retry_delay
         self.context = context
         self.name = name
         self.settings = settings
         if task_base is not None:
             self.task_base = task_base
 
-        # Dynamically create task class and register with Huey instance.
         self.task_class = self.create_task(func, context, name, **settings)
         self.huey._registry.register(self.task_class)
 
@@ -983,8 +1104,9 @@ class TaskWrapper(object):
         return self.huey.restore_all(self.task_class)
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
-                 priority=None, retries=None, retry_delay=None, expires=None,
-                 timeout=None, id=None):
+                 priority=None, retries=None, retry_delay=None,
+                 retry_backoff=None, max_retry_delay=None,
+                 expires=None, timeout=None, id=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1007,6 +1129,8 @@ class TaskWrapper(object):
             eta=eta,
             retries=retries,
             retry_delay=retry_delay,
+            retry_backoff=retry_backoff,
+            max_retry_delay=max_retry_delay,
             priority=priority,
             expires=expires,
             timeout=timeout)
@@ -1036,6 +1160,8 @@ class TaskWrapper(object):
                                eta=eta,
                                retries=kwargs.pop('retries', None),
                                retry_delay=kwargs.pop('retry_delay', None),
+                               retry_backoff=kwargs.pop('retry_backoff', None),
+                               max_retry_delay=kwargs.pop('max_retry_delay', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
                                timeout=kwargs.pop('timeout', None))

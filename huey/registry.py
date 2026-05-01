@@ -5,6 +5,7 @@ from huey.utils import ChordConfig
 
 
 Message = namedtuple('Message', ('id', 'name', 'eta', 'retries', 'retry_delay',
+                                 'retry_backoff', 'max_retry_delay',
                                  'priority', 'args', 'kwargs', 'on_complete',
                                  'on_error', 'expires', 'expires_resolved',
                                  'timeout', 'chord_config'))
@@ -82,6 +83,8 @@ class Registry(object):
             task.eta,
             task.retries,
             task.retry_delay,
+            task.retry_backoff,
+            task.max_retry_delay,
             task.priority,
             task.args,
             task.kwargs,
@@ -116,6 +119,8 @@ class Registry(object):
             message.eta,
             message.retries,
             message.retry_delay,
+            message.retry_backoff,
+            message.max_retry_delay,
             message.priority,
             message.expires,
             on_complete,

@@ -276,3 +276,101 @@ class TestSignals(BaseTestCase):
         self.assertEqual(self.execute_next(), 3)
         self.assertEqual(state1, ['executing', 'complete', 'executing'])
         self.assertEqual(state2, ['executing', 'complete'])
+
+    def test_pre_execute_hook_non_cancel_exception_does_not_interrupt_task(self):
+        from huey.exceptions import CancelExecution
+
+        task_executed = []
+        pre_hook_called = []
+
+        @self.huey.task()
+        def task_a(n):
+            task_executed.append(n)
+            return n + 1
+
+        @self.huey.pre_execute()
+        def flaky_hook(task):
+            pre_hook_called.append('flaky')
+            raise ValueError('some error')
+
+        @self.huey.pre_execute()
+        def normal_hook(task):
+            pre_hook_called.append('normal')
+
+        self._state = []
+        r = task_a(5)
+        self.assertSignals([SIGNAL_ENQUEUED])
+
+        result = self.execute_next()
+        self.assertEqual(result, 6)
+        self.assertEqual(task_executed, [5])
+
+        self.assertSignals([SIGNAL_EXECUTING, SIGNAL_COMPLETE])
+        self.assertEqual(pre_hook_called, ['flaky', 'normal'])
+
+    def test_pre_execute_hook_cancel_execution_interrupts_task(self):
+        from huey.exceptions import CancelExecution
+
+        task_executed = []
+        pre_hook_called = []
+
+        @self.huey.task()
+        def task_a(n):
+            task_executed.append(n)
+            return n + 1
+
+        @self.huey.pre_execute()
+        def cancel_hook(task):
+            pre_hook_called.append('cancel')
+            raise CancelExecution()
+
+        @self.huey.pre_execute()
+        def after_cancel_hook(task):
+            pre_hook_called.append('after')
+
+        self._state = []
+        r = task_a(5)
+        self.assertSignals([SIGNAL_ENQUEUED])
+
+        result = self.execute_next()
+        self.assertIsNone(result)
+        self.assertEqual(task_executed, [])
+
+        # 原代码行为：execute() 先发送 SIGNAL_EXECUTING，然后才调用 _execute()
+        # 执行 pre-execute 钩子。所以信号序列应该是 ['executing', 'canceled']
+        self.assertIn(SIGNAL_EXECUTING, [s[0] for s in self._state])
+        self.assertIn(SIGNAL_CANCELED, [s[0] for s in self._state])
+        self._state = []
+        self.assertEqual(pre_hook_called, ['cancel'])
+
+    def test_post_execute_hook_exceptions_does_not_affect_result(self):
+        task_executed = []
+        post_hook_called = []
+
+        @self.huey.task()
+        def task_a(n):
+            task_executed.append(n)
+            return n + 1
+
+        @self.huey.post_execute()
+        def flaky_hook(task, value, exc):
+            post_hook_called.append('flaky')
+            raise ValueError('post hook error')
+
+        @self.huey.post_execute()
+        def normal_hook(task, value, exc):
+            post_hook_called.append(('normal', value, exc))
+
+        self._state = []
+        r = task_a(5)
+        self.assertSignals([SIGNAL_ENQUEUED])
+
+        result = self.execute_next()
+        self.assertEqual(result, 6)
+        self.assertEqual(task_executed, [5])
+
+        self.assertSignals([SIGNAL_EXECUTING, SIGNAL_COMPLETE])
+        self.assertEqual(post_hook_called, [
+            'flaky',
+            ('normal', 6, None)
+        ])

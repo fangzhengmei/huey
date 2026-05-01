@@ -1,6 +1,8 @@
 import itertools
 from collections import OrderedDict
 
+from huey.exceptions import CancelExecution
+
 
 SIGNAL_CANCELED = 'canceled'
 SIGNAL_COMPLETE = 'complete'
@@ -209,7 +211,8 @@ class SignalDispatcher(ISignalDispatcher):
     def execute_pre_execute_hooks(self, task):
         """
         执行所有 pre-execute 钩子。
-        钩子可以通过抛出 CancelExecution 来取消任务执行。
+        - CancelExecution 异常：重新抛出（导致任务取消）
+        - 其他异常：只记录日志，不抛出（任务继续执行）
         """
         hooks = self._signal.get_hooks(SIGNAL_PRE_EXECUTE)
         for name, callback in hooks.items():
@@ -217,12 +220,16 @@ class SignalDispatcher(ISignalDispatcher):
                 self._logger.debug('Pre-execute hook %s for %s.', name, task)
             try:
                 callback(task)
+            except CancelExecution:
+                if self._logger:
+                    self._logger.warning('Task %s cancelled by %s (pre-execute).',
+                                         task, name)
+                raise
             except Exception:
                 if self._logger:
                     self._logger.exception(
                         'Unhandled exception calling pre-execute '
                         'hook %s for %s.', name, task)
-                raise
 
     def execute_post_execute_hooks(self, task, task_value, exception):
         """

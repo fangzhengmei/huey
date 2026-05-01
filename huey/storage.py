@@ -282,6 +282,59 @@ class BaseStorage(object):
         self.flush_counters()
 
 
+class ResultStoreMixin(object):
+    """
+    Unified result store expiration strategy mixin.
+    
+    This mixin provides two modes:
+    1. Non-expiring mode (expire_time=None): Keep existing behavior
+       - pop_data is destructive (read and delete)
+       - Data never expires
+    
+    2. Expiring mode (expire_time > 0): Similar to RedisExpireStorage
+       - pop_data is non-destructive (same as peek_data)
+       - Data expires after expire_time seconds
+       - Expiration only applies to data with is_result=True
+       - Automatic lazy cleanup of expired data on access
+    """
+    
+    def __init__(self, *args, **kwargs):
+        self._expire_time = kwargs.pop('expire_time', None)
+        super(ResultStoreMixin, self).__init__(*args, **kwargs)
+    
+    def _get_now_ts(self):
+        """Get current timestamp in seconds."""
+        return time.time()
+    
+    def _calculate_expire_ts(self, is_result=False):
+        """Calculate expiration timestamp.
+        
+        Only returns an expiration timestamp if expire_time is set
+        and is_result=True (like RedisExpireStorage behavior).
+        """
+        if self._expire_time is None or not is_result:
+            return None
+        return self._get_now_ts() + self._expire_time
+    
+    def _is_expired(self, expire_ts):
+        """Check if a timestamp is expired."""
+        if expire_ts is None:
+            return False
+        return self._get_now_ts() > expire_ts
+    
+    def _should_destructive_read(self):
+        """Determine if pop_data should be destructive.
+        
+        When expire_time is set, use non-destructive reads (like RedisExpireStorage).
+        When expire_time is None, use destructive reads (backward compatible).
+        """
+        return self._expire_time is None
+    
+    def _clean_expired(self):
+        """Clean up expired data. To be implemented by subclasses."""
+        raise NotImplementedError
+
+
 class BlackHoleStorage(BaseStorage):
     def enqueue(self, data, priority=None): pass
     def dequeue(self): pass
@@ -305,12 +358,12 @@ class BlackHoleStorage(BaseStorage):
     def flush_counters(self): pass
 
 
-class MemoryStorage(BaseStorage):
+class MemoryStorage(ResultStoreMixin, BaseStorage):
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
-        self._results = {}
+        self._results = {}  # Stores {key: (value, expire_ts)}, expire_ts=None means never expire
         self._schedule = []
         self._counters = {}
         self._lock = threading.RLock()
@@ -369,32 +422,95 @@ class MemoryStorage(BaseStorage):
     def flush_schedule(self):
         self._schedule = []
 
+    def _clean_expired(self):
+        """Lazy cleanup of expired items."""
+        with self._lock:
+            expired_keys = [
+                key for key, (_, expire_ts) in self._results.items()
+                if self._is_expired(expire_ts)
+            ]
+            for key in expired_keys:
+                del self._results[key]
+
     def put_data(self, key, value, is_result=False):
-        self._results[key] = value
+        with self._lock:
+            expire_ts = self._calculate_expire_ts(is_result)
+            self._results[key] = (value, expire_ts)
 
     def peek_data(self, key):
-        return self._results.get(key, EmptyData)
+        with self._lock:
+            if key not in self._results:
+                return EmptyData
+            value, expire_ts = self._results[key]
+            if self._is_expired(expire_ts):
+                del self._results[key]
+                return EmptyData
+            return value
 
     def pop_data(self, key):
-        return self._results.pop(key, EmptyData)
+        if self._should_destructive_read():
+            with self._lock:
+                if key not in self._results:
+                    return EmptyData
+                value, expire_ts = self._results[key]
+                if self._is_expired(expire_ts):
+                    del self._results[key]
+                    return EmptyData
+                del self._results[key]
+                return value
+        else:
+            return self.peek_data(key)
 
     def has_data_for_key(self, key):
-        return key in self._results
+        with self._lock:
+            if key not in self._results:
+                return False
+            _, expire_ts = self._results[key]
+            if self._is_expired(expire_ts):
+                del self._results[key]
+                return False
+            return True
 
     def incr(self, key, amount=1):
         with self._lock:
-            self._counters[key] = self._counters.get(key, 0) + amount
-        return self._counters[key]
+            current = self._counters.get(key, 0)
+            
+            if isinstance(current, tuple):
+                val, expire_ts = current
+                if self._is_expired(expire_ts):
+                    val = 0
+            else:
+                val = current
+            
+            new_val = val + amount
+            
+            if self._expire_time is not None:
+                expire_ts = self._get_now_ts() + self._expire_time
+                self._counters[key] = (new_val, expire_ts)
+            else:
+                self._counters[key] = new_val
+            
+            return new_val
 
     def delete_counter(self, key):
         with self._lock:
             self._counters.pop(key, None)
 
+    def delete_data(self, key):
+        with self._lock:
+            if key not in self._results:
+                return False
+            del self._results[key]
+            return True
+
     def result_store_size(self):
+        self._clean_expired()
         return len(self._results)
 
     def result_items(self):
-        return dict(self._results)
+        self._clean_expired()
+        with self._lock:
+            return {key: value for key, (value, _) in self._results.items()}
 
     def flush_results(self):
         self._results = {}
@@ -791,11 +907,11 @@ class BaseSqlStorage(BaseStorage):
                 return curs.fetchall()
 
 
-class SqliteStorage(BaseSqlStorage):
+class SqliteStorage(ResultStoreMixin, BaseSqlStorage):
     begin_sql = 'begin exclusive'
     table_kv = ('create table if not exists kv ('
                 'queue text not null, key text not null, value blob not null, '
-                'primary key(queue, key))')
+                'expire_time real, primary key(queue, key))')
     table_sched = ('create table if not exists schedule ('
                    'id integer not null primary key, queue text not null, '
                    'data blob not null, timestamp real not null)')
@@ -809,7 +925,7 @@ class SqliteStorage(BaseSqlStorage):
     table_counter = ('create table if not exists counter ('
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
-                     'primary key(queue, key))')
+                     'expire_time real, primary key(queue, key))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
            table_counter]
 
@@ -820,15 +936,11 @@ class SqliteStorage(BaseSqlStorage):
         self._cache_mb = cache_mb
         self._fsync = fsync
         self._journal_mode = journal_mode
-        self._timeout = timeout  # Busy timeout in seconds, default is 5.
-        self._conn_kwargs = kwargs
+        self._timeout = timeout
 
-        # By default Sqlite may reuse rowids when rows are removed. This means
-        # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
-        # is needed, then we will utilize Sqlite's AUTOINCREMENT functionality,
-        # which prevents deleted rowids from being reused.
-        # NOTE: changing an existing database is not supported, so you will
-        # need to delete and re-create it to change this value.
+        self._conn_kwargs = dict(kwargs)
+        expire_time = self._conn_kwargs.pop('expire_time', None)
+
         if strict_fifo:
             self.ddl[3] = self.table_task.replace(
                 'primary key',
@@ -836,7 +948,10 @@ class SqliteStorage(BaseSqlStorage):
 
         self.to_blob = lambda b: sqlite3.Binary(b)
 
-        super(SqliteStorage, self).__init__(name)
+        if expire_time is not None:
+            super(SqliteStorage, self).__init__(name, expire_time=expire_time)
+        else:
+            super(SqliteStorage, self).__init__(name)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -848,6 +963,29 @@ class SqliteStorage(BaseSqlStorage):
             conn.execute('pragma cache_size=%s' % (-1000 * self._cache_mb))
         conn.execute('pragma synchronous=%s' % (2 if self._fsync else 0))
         return conn
+
+    def initialize_schema(self):
+        super(SqliteStorage, self).initialize_schema()
+        self._migrate_schema()
+
+    def _migrate_schema(self):
+        """Migrate existing database to add expire_time columns if needed."""
+        with self.db(commit=True, close=True) as curs:
+            curs.execute("PRAGMA table_info(kv)")
+            columns = [row[1] for row in curs.fetchall()]
+            if 'expire_time' not in columns:
+                try:
+                    curs.execute('alter table kv add column expire_time real')
+                except sqlite3.OperationalError:
+                    pass
+
+            curs.execute("PRAGMA table_info(counter)")
+            columns = [row[1] for row in curs.fetchall()]
+            if 'expire_time' not in columns:
+                try:
+                    curs.execute('alter table counter add column expire_time real')
+                except sqlite3.OperationalError:
+                    pass
 
     def enqueue(self, data, priority=None):
         self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
@@ -916,45 +1054,67 @@ class SqliteStorage(BaseSqlStorage):
     def flush_schedule(self):
         self.sql('delete from schedule where queue = ?', (self.name,), True)
 
+    def _clean_expired(self):
+        """Lazy cleanup of expired items."""
+        now = self._get_now_ts()
+        self.sql('delete from kv where queue = ? and expire_time is not null and expire_time < ?',
+                 (self.name, now), commit=True)
+
     def put_data(self, key, value, is_result=False):
-        self.sql('insert or replace into kv (queue, key, value) '
-                 'values (?, ?, ?)',
-                 (self.name, key, self.to_blob(value)), True)
+        expire_ts = self._calculate_expire_ts(is_result)
+        self.sql('insert or replace into kv (queue, key, value, expire_time) '
+                 'values (?, ?, ?, ?)',
+                 (self.name, key, self.to_blob(value), expire_ts), True)
 
     def peek_data(self, key):
-        res = self.sql('select value from kv where queue = ? and key = ?',
+        res = self.sql('select value, expire_time from kv where queue = ? and key = ?',
                        (self.name, key), results=True)
-        return res[0][0] if res else EmptyData
+        if not res:
+            return EmptyData
+        value, expire_ts = res[0]
+        if self._is_expired(expire_ts):
+            self.sql('delete from kv where queue = ? and key = ?',
+                     (self.name, key), commit=True)
+            return EmptyData
+        return value
 
     def pop_data(self, key):
-        with self.db(commit=True) as curs:
-            if sqlite3.sqlite_version_info >= (3, 35, 0):
-                curs.execute('delete from kv where queue = ? and key = ? '
-                             'returning value', (self.name, key))
-                result = curs.fetchone()
-                if result is not None:
-                    return result[0]
-            else:
-                curs.execute('select value from kv where queue = ? and key = ?',
+        if self._should_destructive_read():
+            with self.db(commit=True) as curs:
+                curs.execute('select value, expire_time from kv where queue = ? and key = ?',
                              (self.name, key))
                 result = curs.fetchone()
-                if result is not None:
-                    curs.execute('delete from kv where queue=? and key=?',
+                if result is None:
+                    return EmptyData
+                value, expire_ts = result
+                if self._is_expired(expire_ts):
+                    curs.execute('delete from kv where queue = ? and key = ?',
                                  (self.name, key))
-                    if curs.rowcount == 1:
-                        return result[0]
-            return EmptyData
+                    return EmptyData
+                curs.execute('delete from kv where queue = ? and key = ?',
+                             (self.name, key))
+                return value
+        else:
+            return self.peek_data(key)
 
     def has_data_for_key(self, key):
-        return bool(self.sql('select 1 from kv where queue=? and key=?',
-                             (self.name, key), results=True))
+        res = self.sql('select expire_time from kv where queue = ? and key = ?',
+                       (self.name, key), results=True)
+        if not res:
+            return False
+        expire_ts = res[0][0]
+        if self._is_expired(expire_ts):
+            self.sql('delete from kv where queue = ? and key = ?',
+                     (self.name, key), commit=True)
+            return False
+        return True
 
     def put_if_empty(self, key, value):
         try:
             with self.db(commit=True) as curs:
                 curs.execute('insert or abort into kv '
-                             '(queue, key, value) values (?, ?, ?)',
-                             (self.name, key, self.to_blob(value)))
+                             '(queue, key, value, expire_time) values (?, ?, ?, ?)',
+                             (self.name, key, self.to_blob(value), None))
         except sqlite3.IntegrityError:
             return False
         else:
@@ -962,18 +1122,23 @@ class SqliteStorage(BaseSqlStorage):
 
     def incr(self, key, amount=1):
         with self.db(commit=True) as curs:
+            if self._expire_time is not None:
+                expire_ts = self._get_now_ts() + self._expire_time
+            else:
+                expire_ts = None
+
             if sqlite3.sqlite_version_info >= (3, 35, 0):
-                curs.execute('insert into counter (queue, key, value) '
-                             'values (?, ?, ?) on conflict (queue, key) '
-                             'do update set value = value + ? '
+                curs.execute('insert into counter (queue, key, value, expire_time) '
+                             'values (?, ?, ?, ?) on conflict (queue, key) '
+                             'do update set value = value + ?, expire_time = ? '
                              'returning value',
-                             (self.name, key, amount, amount))
+                             (self.name, key, amount, expire_ts, amount, expire_ts))
                 value, = curs.fetchone()
             elif sqlite3.sqlite_version_info >= (3, 24, 0):
-                curs.execute('insert into counter (queue, key, value) '
-                             'values (?, ?, ?) on conflict (queue, key) '
-                             'do update set value = value + ?',
-                             (self.name, key, amount, amount))
+                curs.execute('insert into counter (queue, key, value, expire_time) '
+                             'values (?, ?, ?, ?) on conflict (queue, key) '
+                             'do update set value = value + ?, expire_time = ?',
+                             (self.name, key, amount, expire_ts, amount, expire_ts))
                 curs.execute('select value from counter '
                              'where queue = ? and key = ?',
                              (self.name, key))
@@ -987,11 +1152,18 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
 
+    def delete_data(self, key):
+        self.sql('delete from kv where queue = ? and key = ?',
+                 (self.name, key), commit=True)
+        return True
+
     def result_store_size(self):
+        self._clean_expired()
         return self.sql('select count(*) from kv where queue=?', (self.name,),
                         results=True)[0][0]
 
     def result_items(self):
+        self._clean_expired()
         res = self.sql('select key, value from kv where queue=?', (self.name,),
                        results=True)
         return dict((k, v) for k, v in res)

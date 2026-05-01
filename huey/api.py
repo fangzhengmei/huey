@@ -37,6 +37,7 @@ from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
 from huey.utils import ChordConfig
 from huey.utils import Error
+from huey.utils import Canceled
 from huey.utils import noop_context
 from huey.utils import normalize_expire_time
 from huey.utils import normalize_time
@@ -419,6 +420,8 @@ class Huey(object):
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
+            if self.results and not isinstance(task, PeriodicTask):
+                self.put_result(task.id, Canceled())
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)

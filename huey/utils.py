@@ -36,6 +36,8 @@ else:
 
 Error = namedtuple('Error', ('metadata',))
 
+Canceled = namedtuple('Canceled', ())
+
 ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback'))
 
 

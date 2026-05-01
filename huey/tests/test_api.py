@@ -23,6 +23,7 @@ from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
 from huey.tests.base import BaseTestCase
+from huey.utils import Canceled
 from huey.utils import Error
 
 
@@ -471,7 +472,7 @@ class TestQueue(BaseTestCase):
 
         t1 = self.huey.dequeue()
         self.assertTrue(self.huey.execute(t1) is None)
-        self.assertTrue(r1.get() is None)
+        self.assertEqual(r1.get(), Canceled())
         self.assertEqual(state, {})
 
         t2 = self.huey.dequeue()
@@ -481,7 +482,7 @@ class TestQueue(BaseTestCase):
 
         t3 = self.huey.dequeue()
         self.assertTrue(self.huey.execute(t3) is None)
-        self.assertTrue(r3.get() is None)
+        self.assertEqual(r3.get(), Canceled())
         self.assertEqual(state, {2: 2})
 
         self.assertFalse(self.huey.is_canceled(r1))
@@ -497,6 +498,7 @@ class TestQueue(BaseTestCase):
         now = datetime.datetime.now()
         past = now - datetime.timedelta(seconds=60)
         future = now + datetime.timedelta(seconds=60)
+        later = now + datetime.timedelta(seconds=120)
 
         r1 = task_a.schedule((1,), eta=past)
         r2 = task_a.schedule((2,), eta=future)
@@ -516,13 +518,19 @@ class TestQueue(BaseTestCase):
         self.huey.cancel_by_id(r2.id)
         self.assertTrue(self.huey.is_canceled(r2))
 
-        scheduled_tasks = self.huey.read_schedule(now + datetime.timedelta(seconds=120))
+        scheduled_tasks = self.huey.read_schedule(later)
         self.assertEqual(len(scheduled_tasks), 1)
         self.assertEqual(scheduled_tasks[0].id, r2.id)
+
+        for task in scheduled_tasks:
+            if self.huey.is_canceled(task, later, peek=False):
+                if self.huey.results and not isinstance(task, PeriodicTask):
+                    self.huey.put_result(task.id, Canceled())
 
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(self.huey.scheduled_count(), 0)
         self.assertEqual(state, [1])
+        self.assertEqual(r2.get(), Canceled())
 
     def test_reschedule(self):
         state = []

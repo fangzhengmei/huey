@@ -22,6 +22,7 @@ from huey.constants import WORKER_PROCESS
 from huey.constants import WORKER_THREAD
 from huey.constants import WORKER_TYPES
 from huey.exceptions import ConfigurationError
+from huey.utils import Canceled
 from huey.utils import greenlet_timeout
 from huey.utils import process_timeout
 from huey.utils import thread_timeout
@@ -178,10 +179,13 @@ class Scheduler(BaseProcess):
         except Exception:
             self._logger.exception('Error reading schedule.')
         else:
+            from huey.api import PeriodicTask
             for task in task_list:
                 if self.huey.is_canceled(task, now, peek=False):
                     self._logger.warning('Scheduled task %s was canceled, skipping',
                                          task.id)
+                    if self.huey.results and not isinstance(task, PeriodicTask):
+                        self.huey.put_result(task.id, Canceled())
                 else:
                     self._logger.debug('Enqueueing %s', task)
                     self.huey.enqueue(task)

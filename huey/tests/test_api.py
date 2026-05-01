@@ -449,6 +449,81 @@ class TestQueue(BaseTestCase):
         self.assertFalse(task_p.is_revoked())
         self.assertFalse(task_p.is_revoked(timestamp=timestamp - second))
 
+    def test_cancel_task(self):
+        state = {}
+        @self.huey.task()
+        def task_a(n):
+            state[n] = n
+            return n + 1
+
+        r1, r2, r3 = task_a(1), task_a(2), task_a(3)
+        self.assertEqual(len(self.huey), 3)
+
+        self.assertFalse(self.huey.is_canceled(r1))
+        self.assertFalse(self.huey.is_canceled(r1.task.id))
+
+        r1.cancel()
+        self.assertTrue(self.huey.is_canceled(r1))
+        self.assertTrue(self.huey.is_canceled(r1.task.id))
+
+        self.huey.cancel_by_id(r3.id)
+        self.assertTrue(self.huey.is_canceled(r3))
+
+        t1 = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(t1) is None)
+        self.assertTrue(r1.get() is None)
+        self.assertEqual(state, {})
+
+        t2 = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(t2), 3)
+        self.assertEqual(r2.get(), 3)
+        self.assertEqual(state, {2: 2})
+
+        t3 = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(t3) is None)
+        self.assertTrue(r3.get() is None)
+        self.assertEqual(state, {2: 2})
+
+        self.assertFalse(self.huey.is_canceled(r1))
+        self.assertFalse(self.huey.is_canceled(r3))
+
+    def test_cancel_scheduled_task(self):
+        state = []
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n + 1
+
+        now = datetime.datetime.now()
+        past = now - datetime.timedelta(seconds=60)
+        future = now + datetime.timedelta(seconds=60)
+
+        r1 = task_a.schedule((1,), eta=past)
+        r2 = task_a.schedule((2,), eta=future)
+
+        t1 = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(t1, now), 2)
+        self.assertEqual(state, [1])
+
+        t2 = self.huey.dequeue()
+        self.assertFalse(self.huey.ready_to_run(t2, now))
+        self.huey.execute(t2, now)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        scheduled_task = self.huey.scheduled()[0]
+        self.assertEqual(scheduled_task.id, r2.id)
+
+        self.huey.cancel_by_id(r2.id)
+        self.assertTrue(self.huey.is_canceled(r2))
+
+        scheduled_tasks = self.huey.read_schedule(now + datetime.timedelta(seconds=120))
+        self.assertEqual(len(scheduled_tasks), 1)
+        self.assertEqual(scheduled_tasks[0].id, r2.id)
+
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(state, [1])
+
     def test_reschedule(self):
         state = []
         @self.huey.task()

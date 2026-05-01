@@ -179,8 +179,12 @@ class Scheduler(BaseProcess):
             self._logger.exception('Error reading schedule.')
         else:
             for task in task_list:
-                self._logger.debug('Enqueueing %s', task)
-                self.huey.enqueue(task)
+                if self.huey.is_canceled(task, now, peek=False):
+                    self._logger.warning('Scheduled task %s was canceled, skipping',
+                                         task.id)
+                else:
+                    self._logger.debug('Enqueueing %s', task)
+                    self.huey.enqueue(task)
 
         if self.periodic and self._next_periodic <= time.monotonic():
             self._next_periodic += self.periodic_task_seconds

@@ -642,6 +642,15 @@ class Huey(object):
     def restore_by_id(self, id):
         return self.restore(Task(id=id))
 
+    def cancel(self, task):
+        self.revoke(task, revoke_once=True)
+
+    def cancel_by_id(self, id):
+        self.cancel(Task(id=id))
+
+    def is_canceled(self, task, timestamp=None, peek=True):
+        return self.is_revoked(task, timestamp, peek)
+
     def _check_revoked(self, revoke_id, timestamp=None, peek=True):
         """
         Checks if a task is revoked, returns a 2-tuple indicating:
@@ -1257,6 +1266,9 @@ class Result(object):
 
     def revoke(self, revoke_once=True):
         self.huey.revoke(self.task, revoke_once=revoke_once)
+
+    def cancel(self):
+        self.huey.cancel(self.task)
 
     def restore(self):
         return self.huey.restore(self.task)

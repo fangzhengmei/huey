@@ -305,6 +305,10 @@ class Huey(object):
         if task.expires:
             task.resolve_expires(self.utc)
 
+        # Set initial progress status when task is enqueued
+        if not isinstance(task, PeriodicTask):
+            self.set_progress(task, status=TaskStatus.PENDING)
+
         self._emit(S.SIGNAL_ENQUEUED, task)
 
         if self._immediate:
@@ -319,6 +323,9 @@ class Huey(object):
             current = task
             results = []
             while current is not None:
+                # Also set progress for chained tasks
+                if not isinstance(current, PeriodicTask):
+                    self.set_progress(current, status=TaskStatus.PENDING)
                 results.append(Result(self, current))
                 current = current.on_complete
             return ResultGroup(results)
@@ -979,6 +986,11 @@ class Task(object):
     def set_progress(self, progress=None, stage=None):
         if hasattr(self, '_huey') and self._huey is not None:
             return self._huey.set_progress(self, progress=progress, stage=stage)
+        return None
+
+    def get_progress(self):
+        if hasattr(self, '_huey') and self._huey is not None:
+            return self._huey.get_progress(self)
         return None
 
     def execute(self):

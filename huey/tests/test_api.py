@@ -2627,7 +2627,10 @@ class TestTaskProgress(BaseTestCase):
         r = task_a(3)
         
         progress = r.get_progress()
-        self.assertEqual(progress, None)
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress['status'], TaskStatus.PENDING)
+        self.assertEqual(progress['progress'], 0)
+        self.assertEqual(progress['stage'], '')
         
         self.assertEqual(self.execute_next(), 4)
         
@@ -2738,8 +2741,10 @@ class TestTaskProgress(BaseTestCase):
 
         r = simple_task()
         
-        self.huey.set_progress(r, progress=50)
+        # 入队后已有初始进度
         self.assertIsNotNone(r.get_progress())
+        self.assertEqual(r.get_progress()['status'], TaskStatus.PENDING)
+        self.assertEqual(r.get_progress()['progress'], 0)
         
         self.huey.clear_progress(r)
         self.assertIsNone(r.get_progress())
@@ -2768,3 +2773,61 @@ class TestTaskProgress(BaseTestCase):
         
         result = task.set_progress(progress=50)
         self.assertIsNone(result)
+
+    def test_initial_progress_on_enqueue(self):
+        @self.huey.task()
+        def simple_task(n):
+            return n * 2
+
+        r = simple_task(5)
+        
+        progress = r.get_progress()
+        self.assertIsNotNone(progress)
+        self.assertEqual(progress['status'], TaskStatus.PENDING)
+        self.assertEqual(progress['progress'], 0)
+        self.assertEqual(progress['stage'], '')
+        
+        self.assertEqual(self.execute_next(), 10)
+        
+        progress = r.get_progress()
+        self.assertEqual(progress['status'], TaskStatus.COMPLETED)
+        self.assertEqual(progress['progress'], 100)
+        self.assertEqual(progress['stage'], '')
+
+    def test_progress_stage_persistence(self):
+        progress_state = []
+        
+        @self.huey.task(context=True)
+        def task_with_stage(task=None):
+            task.set_progress(progress=30, stage='Loading data')
+            progress_state.append(task.get_progress())
+            
+            task.set_progress(progress=60, stage='Processing')
+            progress_state.append(task.get_progress())
+            
+            task.set_progress(progress=90, stage='Saving results')
+            progress_state.append(task.get_progress())
+            
+            return 'done'
+
+        r = task_with_stage()
+        
+        self.assertEqual(self.execute_next(), 'done')
+        
+        self.assertEqual(len(progress_state), 3)
+        self.assertEqual(progress_state[0]['progress'], 30)
+        self.assertEqual(progress_state[0]['stage'], 'Loading data')
+        self.assertEqual(progress_state[0]['status'], TaskStatus.RUNNING)
+        
+        self.assertEqual(progress_state[1]['progress'], 60)
+        self.assertEqual(progress_state[1]['stage'], 'Processing')
+        self.assertEqual(progress_state[1]['status'], TaskStatus.RUNNING)
+        
+        self.assertEqual(progress_state[2]['progress'], 90)
+        self.assertEqual(progress_state[2]['stage'], 'Saving results')
+        self.assertEqual(progress_state[2]['status'], TaskStatus.RUNNING)
+        
+        final_progress = r.get_progress()
+        self.assertEqual(final_progress['progress'], 100)
+        self.assertEqual(final_progress['stage'], 'Saving results')
+        self.assertEqual(final_progress['status'], TaskStatus.COMPLETED)

@@ -304,6 +304,7 @@ class Huey(object):
         if task.expires:
             task.resolve_expires(self.utc)
 
+        task.timeline['enqueued_at'] = self._get_timestamp()
         self._emit(S.SIGNAL_ENQUEUED, task)
 
         if self._immediate:
@@ -410,6 +411,15 @@ class Huey(object):
         return (utcnow() if self.utc else
                 datetime.datetime.now())
 
+    def _timeline_key(self, task_id):
+        return 'tl:%s' % task_id
+
+    def _put_timeline(self, task):
+        self.put(self._timeline_key(task.id), task.timeline)
+
+    def _get_timeline(self, task_id, peek=False):
+        return self.get(self._timeline_key(task_id), peek=peek)
+
     def execute(self, task, timestamp=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
@@ -424,6 +434,7 @@ class Huey(object):
             self._emit(S.SIGNAL_EXPIRED, task)
         else:
             logger.info('Executing %s', task)
+            task.timeline['executing_at'] = timestamp
             self._emit(S.SIGNAL_EXECUTING, task)
             return self._execute(task, timestamp)
 
@@ -507,10 +518,14 @@ class Huey(object):
 
         if self.results and not isinstance(task, PeriodicTask):
             if exception is not None:
+                task.timeline['failed_at'] = self._get_timestamp()
                 error_data = self.build_error_result(task, exception)
                 self.put_result(task.id, Error(error_data))
             elif task_value is not None or self.store_none:
+                task.timeline['completed_at'] = self._get_timestamp()
                 self.put_result(task.id, task_value)
+
+            self._put_timeline(task)
 
         if self._post_execute:
             self._run_post_execute(task, task_value, exception)
@@ -697,6 +712,7 @@ class Huey(object):
         data = self.serialize_task(task)
         eta = task.eta or datetime.datetime.fromtimestamp(0)
         self.storage.add_to_schedule(data, eta)
+        task.timeline['scheduled_at'] = self._get_timestamp()
         logger.info('Added task %s to schedule, eta %s', task.id, eta)
         self._emit(S.SIGNAL_SCHEDULED, task)
 
@@ -821,6 +837,7 @@ class Task(object):
 
         self.on_complete = on_complete
         self.on_error = on_error
+        self.timeline = {}
 
     @property
     def data(self):
@@ -1292,6 +1309,9 @@ class Result(object):
 
     def reset(self):
         self._result = EmptyData
+
+    def get_timeline(self, peek=False):
+        return self.huey._get_timeline(self.id, peek=peek)
 
 
 class ResultGroup(object):

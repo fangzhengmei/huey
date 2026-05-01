@@ -2615,3 +2615,127 @@ class TestCustomErrorMetadata(BaseTestCase):
 
         self.assertEqual(self.huey.result_count(), 0)
         self.assertEqual(len(self.huey), 0)
+
+
+class TestTaskTimeline(BaseTestCase):
+    def test_timeline_successful_execution(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        result = task_a(3)
+
+        task = self.huey.dequeue()
+        self.assertIn('enqueued_at', task.timeline)
+        self.assertNotIn('executing_at', task.timeline)
+        self.assertNotIn('completed_at', task.timeline)
+
+        self.assertEqual(self.huey.execute(task), 4)
+
+        self.assertIn('enqueued_at', task.timeline)
+        self.assertIn('executing_at', task.timeline)
+        self.assertIn('completed_at', task.timeline)
+        self.assertNotIn('failed_at', task.timeline)
+
+        self.assertTrue(task.timeline['enqueued_at'] <= task.timeline['executing_at'])
+        self.assertTrue(task.timeline['executing_at'] <= task.timeline['completed_at'])
+
+        timeline = result.get_timeline()
+        self.assertIsNotNone(timeline)
+        self.assertIn('enqueued_at', timeline)
+        self.assertIn('executing_at', timeline)
+        self.assertIn('completed_at', timeline)
+        self.assertNotIn('failed_at', timeline)
+
+    def test_timeline_failed_execution(self):
+        @self.huey.task()
+        def task_e(n):
+            raise TestError('fail')
+
+        result = task_e(0)
+
+        task = self.huey.dequeue()
+        self.assertIn('enqueued_at', task.timeline)
+
+        self.assertTrue(self.huey.execute(task) is None)
+
+        self.assertIn('enqueued_at', task.timeline)
+        self.assertIn('executing_at', task.timeline)
+        self.assertIn('failed_at', task.timeline)
+        self.assertNotIn('completed_at', task.timeline)
+
+        self.assertTrue(task.timeline['enqueued_at'] <= task.timeline['executing_at'])
+        self.assertTrue(task.timeline['executing_at'] <= task.timeline['failed_at'])
+
+        timeline = result.get_timeline()
+        self.assertIsNotNone(timeline)
+        self.assertIn('enqueued_at', timeline)
+        self.assertIn('executing_at', timeline)
+        self.assertIn('failed_at', timeline)
+        self.assertNotIn('completed_at', timeline)
+
+    def test_timeline_scheduled_task(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        now = datetime.datetime.now()
+        result = task_a.schedule((3,), delay=60)
+
+        task = self.huey.dequeue()
+        self.assertIn('enqueued_at', task.timeline)
+        self.assertNotIn('scheduled_at', task.timeline)
+
+        self.assertTrue(self.huey.execute(task) is None)
+
+        self.assertIn('enqueued_at', task.timeline)
+        self.assertIn('scheduled_at', task.timeline)
+        self.assertNotIn('executing_at', task.timeline)
+
+        self.assertTrue(task.timeline['enqueued_at'] <= task.timeline['scheduled_at'])
+
+        scheduled_tasks = self.huey.scheduled()
+        self.assertEqual(len(scheduled_tasks), 1)
+        scheduled_task = scheduled_tasks[0]
+
+        future_ts = now + datetime.timedelta(seconds=61)
+        self.assertEqual(self.huey.execute(scheduled_task, future_ts), 4)
+
+        self.assertIn('enqueued_at', scheduled_task.timeline)
+        self.assertIn('scheduled_at', scheduled_task.timeline)
+        self.assertIn('executing_at', scheduled_task.timeline)
+        self.assertIn('completed_at', scheduled_task.timeline)
+
+        self.assertTrue(scheduled_task.timeline['enqueued_at'] <= scheduled_task.timeline['scheduled_at'])
+        self.assertTrue(scheduled_task.timeline['scheduled_at'] <= scheduled_task.timeline['executing_at'])
+        self.assertTrue(scheduled_task.timeline['executing_at'] <= scheduled_task.timeline['completed_at'])
+
+    def test_timeline_peek(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        result = task_a(3)
+        task = self.huey.dequeue()
+        self.huey.execute(task)
+
+        timeline1 = result.get_timeline(peek=True)
+        self.assertIsNotNone(timeline1)
+
+        timeline2 = result.get_timeline(peek=True)
+        self.assertEqual(timeline1, timeline2)
+
+        timeline3 = result.get_timeline(peek=False)
+        self.assertEqual(timeline1, timeline3)
+
+        timeline4 = result.get_timeline(peek=False)
+        self.assertIsNone(timeline4)
+
+    def test_task_timeline_initialized(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        task = task_a.s(3)
+        self.assertIsInstance(task.timeline, dict)
+        self.assertEqual(len(task.timeline), 0)

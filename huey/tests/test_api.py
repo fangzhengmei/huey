@@ -7,6 +7,7 @@ from huey.api import MemoryHuey
 from huey.api import PeriodicTask
 from huey.api import Result
 from huey.api import ResultGroup
+from huey.api import RetryStrategy
 from huey.api import Task
 from huey.api import TaskWrapper
 from huey.api import chord
@@ -1043,6 +1044,82 @@ class TestQueue(BaseTestCase):
         self.assertEqual(state, [2])
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(self.huey.result_count(), 0)
+
+    def test_retry_strategy_calculate_delay(self):
+        rs = RetryStrategy(retries=3, retry_delay=1, retry_backoff=2.0)
+        
+        self.assertEqual(rs.calculate_delay(1), 2.0)
+        self.assertEqual(rs.calculate_delay(2), 4.0)
+        self.assertEqual(rs.calculate_delay(3), 8.0)
+        
+        rs_default = RetryStrategy()
+        self.assertEqual(rs_default.calculate_delay(1), 0)
+        
+        rs_no_backoff = RetryStrategy(retries=3, retry_delay=5)
+        self.assertEqual(rs_no_backoff.retry_backoff, 1.0)
+        self.assertEqual(rs_no_backoff.calculate_delay(1), 5)
+        self.assertEqual(rs_no_backoff.calculate_delay(2), 5)
+        self.assertEqual(rs_no_backoff.calculate_delay(3), 5)
+        
+        rs_max_delay = RetryStrategy(
+            retries=5, retry_delay=1, retry_backoff=2.0, max_retry_delay=10)
+        self.assertEqual(rs_max_delay.calculate_delay(1), 2.0)
+        self.assertEqual(rs_max_delay.calculate_delay(2), 4.0)
+        self.assertEqual(rs_max_delay.calculate_delay(3), 8.0)
+        self.assertEqual(rs_max_delay.calculate_delay(4), 10)
+        self.assertEqual(rs_max_delay.calculate_delay(5), 10)
+
+    def test_retry_backoff_in_task(self):
+        state = [0]
+        
+        @self.huey.task(retries=3, retry_delay=1, retry_backoff=2.0)
+        def task_backoff():
+            state[0] += 1
+            raise ValueError('try again')
+        
+        r = task_backoff()
+        base_time = datetime.datetime.now()
+        
+        self.assertTrue(self.execute_next() is None)
+        self.trap_exception(r)
+        self.assertEqual(state[0], 1)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        
+        task1, = self.huey.scheduled()
+        self.assertEqual(task1.retries, 2)
+        self.assertEqual(task1._retry_attempt, 1)
+        delay_seconds = (task1.eta - base_time).total_seconds()
+        self.assertAlmostEqual(delay_seconds, 2.0, delta=0.5)
+        
+        self.huey.flush()
+
+    def test_task_with_retry_strategy(self):
+        strategy = RetryStrategy(
+            retries=3, retry_delay=2, retry_backoff=1.5, max_retry_delay=10)
+        
+        @self.huey.task(retry_strategy=strategy)
+        def task_with_strategy():
+            raise ValueError('error')
+        
+        r = task_with_strategy()
+        base_time = datetime.datetime.now()
+        
+        self.assertTrue(self.execute_next() is None)
+        self.trap_exception(r)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        
+        task1, = self.huey.scheduled()
+        self.assertEqual(task1.retries, 2)
+        self.assertEqual(task1.retry_delay, 2)
+        self.assertEqual(task1.retry_backoff, 1.5)
+        self.assertEqual(task1.max_retry_delay, 10)
+        self.assertEqual(task1._retry_attempt, 1)
+        
+        expected_delay = 2 * 1.5 ** 1
+        actual_delay = (task1.eta - base_time).total_seconds()
+        self.assertAlmostEqual(actual_delay, expected_delay, delta=0.5)
+        
+        self.huey.flush()
 
     def test_cancel_execution(self):
         @self.huey.task()

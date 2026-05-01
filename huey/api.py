@@ -629,12 +629,14 @@ class Huey(object):
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
         task.retries -= 1
+        task._retry_attempt += 1
         logger.info('Requeueing %s, %s retries', task.id, task.retries)
         if retry_eta is not None:
             task.eta = retry_eta
             self.add_schedule(task)
         elif task.retry_delay:
-            delay_seconds = task.retry_strategy.calculate_delay()
+            delay_seconds = task.retry_strategy.calculate_delay(
+                task._retry_attempt)
             delay = datetime.timedelta(seconds=delay_seconds)
             task.eta = timestamp + delay
             self.add_schedule(task)
@@ -904,6 +906,7 @@ class Task(object):
 
         self.on_complete = on_complete
         self.on_error = on_error
+        self._retry_attempt = 0
 
     @property
     def retries(self):

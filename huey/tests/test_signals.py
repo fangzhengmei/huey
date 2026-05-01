@@ -375,6 +375,7 @@ class TestSignals(BaseTestCase):
             ('normal', 6, None)
         ])
 
+    # Regression coverage for hook ordering/cancel/error edge cases.
     def test_hooks_execution_order(self):
         pre_hooks = []
         post_hooks = []

@@ -210,9 +210,9 @@ class SignalDispatcher(ISignalDispatcher):
 
     def execute_pre_execute_hooks(self, task):
         """
-        执行所有 pre-execute 钩子。
-        - CancelExecution 异常：重新抛出（导致任务取消）
-        - 其他异常：只记录日志，不抛出（任务继续执行）
+        Execute pre-execute hooks with legacy-compatible semantics:
+        - CancelExecution is re-raised to cancel the task.
+        - Other exceptions are logged and execution continues.
         """
         hooks = self._signal.get_hooks(SIGNAL_PRE_EXECUTE)
         for name, callback in hooks.items():
@@ -230,6 +230,8 @@ class SignalDispatcher(ISignalDispatcher):
                     self._logger.exception(
                         'Unhandled exception calling pre-execute '
                         'hook %s for %s.', name, task)
+                # Preserve pre-refactor behavior: non-cancel hook failures do
+                # not abort task execution.
 
     def execute_post_execute_hooks(self, task, task_value, exception):
         """

@@ -737,10 +737,19 @@ class Huey(object):
         if task.tags is None:
             return False
 
+        if tags is None:
+            return False
+
+        if isinstance(tags, (list, tuple)) and len(tags) == 0:
+            return False
+
         task_tags = set(task.tags) if isinstance(task.tags, (list, tuple)) \
             else {task.tags}
         search_tags = set(tags) if isinstance(tags, (list, tuple)) \
             else {tags}
+
+        if len(search_tags) == 0:
+            return False
 
         if match_all:
             return search_tags.issubset(task_tags)

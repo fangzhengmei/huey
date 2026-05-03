@@ -3021,3 +3021,197 @@ class TestTaskTags(BaseTestCase):
 
         self.assertEqual(task_default.tags, ['default', 'tags'])
         self.assertEqual(task_override.tags, ['overridden', 'tags'])
+
+    def test_empty_tags_input_pending_or(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        send_email('alice@example.com')
+        send_email('bob@example.com')
+
+        self.assertEqual(self.huey.pending_count(), 2)
+
+        tasks_empty_list = self.huey.pending_by_tags([])
+        self.assertEqual(len(tasks_empty_list), 0)
+
+        count_empty_list = self.huey.pending_count_by_tags([])
+        self.assertEqual(count_empty_list, 0)
+
+        tasks_empty_tuple = self.huey.pending_by_tags(())
+        self.assertEqual(len(tasks_empty_tuple), 0)
+
+        count_empty_tuple = self.huey.pending_count_by_tags(())
+        self.assertEqual(count_empty_tuple, 0)
+
+    def test_empty_tags_input_pending_match_all(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        send_email('alice@example.com')
+        send_email('bob@example.com')
+
+        self.assertEqual(self.huey.pending_count(), 2)
+
+        tasks_empty_list = self.huey.pending_by_tags([], match_all=True)
+        self.assertEqual(len(tasks_empty_list), 0)
+
+        count_empty_list = self.huey.pending_count_by_tags([], match_all=True)
+        self.assertEqual(count_empty_list, 0)
+
+        tasks_empty_tuple = self.huey.pending_by_tags((), match_all=True)
+        self.assertEqual(len(tasks_empty_tuple), 0)
+
+        count_empty_tuple = self.huey.pending_count_by_tags((), match_all=True)
+        self.assertEqual(count_empty_tuple, 0)
+
+    def test_empty_tags_input_scheduled_or(self):
+        import datetime
+
+        @self.huey.task(tags=['important'])
+        def important_task(n):
+            return n
+
+        for i in range(3):
+            important_task.schedule(i, delay=60, tags=['scheduled', 'important'])
+
+        for _ in range(3):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        self.assertEqual(self.huey.scheduled_count(), 3)
+
+        tasks_empty_list = self.huey.scheduled_by_tags([])
+        self.assertEqual(len(tasks_empty_list), 0)
+
+        count_empty_list = self.huey.scheduled_count_by_tags([])
+        self.assertEqual(count_empty_list, 0)
+
+        tasks_empty_tuple = self.huey.scheduled_by_tags(())
+        self.assertEqual(len(tasks_empty_tuple), 0)
+
+        count_empty_tuple = self.huey.scheduled_count_by_tags(())
+        self.assertEqual(count_empty_tuple, 0)
+
+    def test_empty_tags_input_scheduled_match_all(self):
+        import datetime
+
+        @self.huey.task(tags=['important'])
+        def important_task(n):
+            return n
+
+        for i in range(3):
+            important_task.schedule(i, delay=60, tags=['scheduled', 'important'])
+
+        for _ in range(3):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        self.assertEqual(self.huey.scheduled_count(), 3)
+
+        tasks_empty_list = self.huey.scheduled_by_tags([], match_all=True)
+        self.assertEqual(len(tasks_empty_list), 0)
+
+        count_empty_list = self.huey.scheduled_count_by_tags([], match_all=True)
+        self.assertEqual(count_empty_list, 0)
+
+        tasks_empty_tuple = self.huey.scheduled_by_tags((), match_all=True)
+        self.assertEqual(len(tasks_empty_tuple), 0)
+
+        count_empty_tuple = self.huey.scheduled_count_by_tags((), match_all=True)
+        self.assertEqual(count_empty_tuple, 0)
+
+    def test_none_tags_input_pending(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        send_email('alice@example.com')
+        send_email('bob@example.com')
+
+        self.assertEqual(self.huey.pending_count(), 2)
+
+        tasks_none = self.huey.pending_by_tags(None)
+        self.assertEqual(len(tasks_none), 0)
+
+        count_none = self.huey.pending_count_by_tags(None)
+        self.assertEqual(count_none, 0)
+
+    def test_none_tags_input_scheduled(self):
+        import datetime
+
+        @self.huey.task(tags=['important'])
+        def important_task(n):
+            return n
+
+        for i in range(2):
+            important_task.schedule(i, delay=60, tags=['scheduled', 'important'])
+
+        for _ in range(2):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        self.assertEqual(self.huey.scheduled_count(), 2)
+
+        tasks_none = self.huey.scheduled_by_tags(None)
+        self.assertEqual(len(tasks_none), 0)
+
+        count_none = self.huey.scheduled_count_by_tags(None)
+        self.assertEqual(count_none, 0)
+
+    def test_task_tags_empty_list(self):
+        @self.huey.task(tags=[])
+        def task_with_empty_tags(n):
+            return n + 1
+
+        task = task_with_empty_tags.s(1)
+        self.assertEqual(task.tags, [])
+
+        task_with_empty_tags(2)
+        pending_task = self.huey.dequeue()
+        self.assertEqual(pending_task.tags, [])
+
+        tasks_matched = self.huey.pending_by_tags(['important'])
+        self.assertEqual(len(tasks_matched), 0)
+
+    def test_task_tags_none(self):
+        @self.huey.task(tags=None)
+        def task_with_none_tags(n):
+            return n + 1
+
+        task = task_with_none_tags.s(1)
+        self.assertIsNone(task.tags)
+
+    def test_empty_string_tags(self):
+        @self.huey.task(tags=['important', ''])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        task = send_email.s('test@example.com')
+        self.assertEqual(task.tags, ['important', ''])
+
+        send_email('alice@example.com')
+
+        tasks_with_important = self.huey.pending_by_tags('important')
+        self.assertEqual(len(tasks_with_important), 1)
+
+        tasks_with_empty = self.huey.pending_by_tags('')
+        self.assertEqual(len(tasks_with_empty), 1)
+
+    def test_empty_string_tags_match_all(self):
+        @self.huey.task(tags=['important', ''])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['important'])
+        def send_notification(user):
+            return 'Sent notification to %s' % user
+
+        send_email('alice@example.com')
+        send_notification('bob@example.com')
+
+        tasks_with_important_and_empty = self.huey.pending_by_tags(
+            ['important', ''], match_all=True)
+        self.assertEqual(len(tasks_with_important_and_empty), 1)
+        self.assertEqual(tasks_with_important_and_empty[0].name, 'send_email')

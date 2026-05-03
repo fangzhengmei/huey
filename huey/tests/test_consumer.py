@@ -5,6 +5,8 @@ from huey.api import crontab
 from huey.consumer import Consumer
 from huey.consumer import Scheduler
 from huey.consumer_options import ConsumerConfig
+from huey.constants import WORKER_GREENLET
+from huey.exceptions import ConfigurationError
 from huey.exceptions import TaskException
 from huey.exceptions import TaskTimeout
 from huey.tests.base import BaseTestCase
@@ -175,3 +177,61 @@ class TestConsumerConfig(BaseTestCase):
         assertInvalid(scheduler_interval=90)
         assertInvalid(scheduler_interval=7)
         assertInvalid(scheduler_interval=45)
+
+    def test_create_consumer_invalid_scheduler_interval(self):
+        def assertInvalid(**kwargs):
+            self.assertRaises(ValueError, self.huey.create_consumer, **kwargs)
+
+        assertInvalid(scheduler_interval=90)
+        assertInvalid(scheduler_interval=7)
+        assertInvalid(scheduler_interval=45)
+        assertInvalid(scheduler_interval=0)
+
+        valid_intervals = [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60]
+        for interval in valid_intervals:
+            consumer = self.huey.create_consumer(scheduler_interval=interval)
+            self.assertEqual(consumer.scheduler_interval, interval)
+
+    def test_create_consumer_max_tasks_requires_health_check(self):
+        self.assertRaises(
+            ConfigurationError,
+            self.huey.create_consumer,
+            max_tasks=10,
+            check_worker_health=False)
+
+        consumer = self.huey.create_consumer(max_tasks=10)
+        self.assertEqual(consumer.max_tasks, 10)
+        self.assertTrue(consumer._health_check)
+
+        consumer2 = self.huey.create_consumer(
+            max_tasks=100,
+            check_worker_health=True)
+        self.assertEqual(consumer2.max_tasks, 100)
+        self.assertTrue(consumer2._health_check)
+
+    def test_consumer_config_max_tasks_requires_health_check(self):
+        cfg = ConsumerConfig(max_tasks=10, check_worker_health=False)
+        self.assertRaises(ConfigurationError, cfg.validate)
+
+        cfg2 = ConsumerConfig(max_tasks=10, check_worker_health=True)
+        cfg2.validate()
+        self.assertEqual(cfg2.max_tasks, 10)
+
+    def test_worker_type_normalization(self):
+        cfg = ConsumerConfig(worker_type='gevent')
+        self.assertEqual(cfg.worker_type, 'gevent')
+        self.assertEqual(cfg.normalized_worker_type, WORKER_GREENLET)
+
+        cfg2 = ConsumerConfig(worker_type=WORKER_GREENLET)
+        self.assertEqual(cfg2.worker_type, WORKER_GREENLET)
+        self.assertEqual(cfg2.normalized_worker_type, WORKER_GREENLET)
+
+        cfg3 = ConsumerConfig(worker_type='thread')
+        self.assertEqual(cfg3.worker_type, 'thread')
+        self.assertEqual(cfg3.normalized_worker_type, 'thread')
+
+    def test_values_returns_normalized_worker_type(self):
+        cfg = ConsumerConfig(worker_type='gevent')
+        values = cfg.values
+        self.assertEqual(values['worker_type'], WORKER_GREENLET)
+        self.assertNotEqual(values['worker_type'], 'gevent')

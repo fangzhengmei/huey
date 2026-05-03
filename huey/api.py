@@ -164,7 +164,7 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, priority=None, context=False,
-             name=None, expires=None, timeout=None, **kwargs):
+             name=None, expires=None, timeout=None, tags=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -177,12 +177,13 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_tags=tags,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       priority=None, context=False, name=None, expires=None,
-                      timeout=None, **kwargs):
+                      timeout=None, tags=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -198,6 +199,7 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_tags=tags,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
                 **kwargs)
@@ -731,12 +733,54 @@ class Huey(object):
     def pending_count(self):
         return self.storage.queue_size()
 
+    def _matches_tags(self, task, tags, match_all=False):
+        if task.tags is None:
+            return False
+
+        task_tags = set(task.tags) if isinstance(task.tags, (list, tuple)) \
+            else {task.tags}
+        search_tags = set(tags) if isinstance(tags, (list, tuple)) \
+            else {tags}
+
+        if match_all:
+            return search_tags.issubset(task_tags)
+        else:
+            return not search_tags.isdisjoint(task_tags)
+
+    def pending_by_tags(self, tags, limit=None, match_all=False):
+        tasks = []
+        for task in self.pending(limit):
+            if self._matches_tags(task, tags, match_all):
+                tasks.append(task)
+        return tasks
+
+    def pending_count_by_tags(self, tags, match_all=False):
+        count = 0
+        for task in self.pending():
+            if self._matches_tags(task, tags, match_all):
+                count += 1
+        return count
+
     def scheduled(self, limit=None):
         return [self.deserialize_task(task)
                 for task in self.storage.scheduled_items(limit)]
 
     def scheduled_count(self):
         return self.storage.schedule_size()
+
+    def scheduled_by_tags(self, tags, limit=None, match_all=False):
+        tasks = []
+        for task in self.scheduled(limit):
+            if self._matches_tags(task, tags, match_all):
+                tasks.append(task)
+        return tasks
+
+    def scheduled_count_by_tags(self, tags, match_all=False):
+        count = 0
+        for task in self.scheduled():
+            if self._matches_tags(task, tags, match_all):
+                count += 1
+        return count
 
     def all_results(self):
         return self.storage.result_items()
@@ -797,11 +841,12 @@ class Task(object):
     default_retries = 0
     default_retry_delay = 0
     default_timeout = None
+    default_tags = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None):
+                 timeout=None, chord_config=None, tags=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -818,6 +863,7 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+        self.tags = tags if tags is not None else self.default_tags
 
         self.on_complete = on_complete
         self.on_error = on_error
@@ -841,6 +887,8 @@ class Task(object):
             rep += ' %s retries' % self.retries
         if self.timeout:
             rep += ' timeout=%s' % self.timeout
+        if self.tags:
+            rep += ' tags=%s' % self.tags
         if self.on_complete:
             rep += ' -> %s' % self.on_complete
         if self.on_error:
@@ -984,7 +1032,7 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None, expires=None,
-                 timeout=None, id=None):
+                 timeout=None, id=None, tags=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1009,7 +1057,8 @@ class TaskWrapper(object):
             retry_delay=retry_delay,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            tags=tags)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1038,7 +1087,8 @@ class TaskWrapper(object):
                                retry_delay=kwargs.pop('retry_delay', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               tags=kwargs.pop('tags', None))
 
 
 class TaskLock(object):
@@ -1262,7 +1312,7 @@ class Result(object):
         return self.huey.restore(self.task)
 
     def reschedule(self, eta=None, delay=None, expires=None, priority=None,
-                   preserve_pipeline=True):
+                   preserve_pipeline=True, tags=None):
         # Rescheduling works by revoking the currently-scheduled task (nothing
         # is done to check if the task has already run, however). Then the
         # original task's data is used to enqueue a new task with a new task ID
@@ -1287,7 +1337,8 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            tags=tags if tags is not None else self.task.tags)
         return self.huey.enqueue(task)
 
     def reset(self):

@@ -3,8 +3,16 @@ import optparse
 from collections import namedtuple
 from logging import FileHandler
 
+try:
+    import gevent
+    from gevent import Greenlet
+except ImportError:
+    Greenlet = None
+
+from huey.constants import WORKER_GREENLET
 from huey.constants import WORKER_THREAD
 from huey.constants import WORKER_TYPES
+from huey.exceptions import ConfigurationError
 
 
 config_defaults = (
@@ -132,6 +140,13 @@ class ConsumerConfig(namedtuple('_ConsumerConfig', config_keys)):
         args = [config[key] for key in config_keys]
         return super(ConsumerConfig, cls).__new__(cls, *args)
 
+    @property
+    def normalized_worker_type(self):
+        worker_type = self.worker_type
+        if worker_type == 'gevent':
+            return WORKER_GREENLET
+        return worker_type
+
     def validate(self):
         if self.backoff < 1:
             raise ValueError('The backoff must be greater than 1.')
@@ -141,6 +156,12 @@ class ConsumerConfig(namedtuple('_ConsumerConfig', config_keys)):
         if 60 % self.scheduler_interval != 0:
             raise ValueError('The scheduler interval must be a factor of 60: '
                              '1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60')
+        if self.max_tasks and not self.check_worker_health:
+            raise ConfigurationError('max_tasks requires check_worker_health '
+                                     'be enabled.')
+        worker_type = self.normalized_worker_type
+        if worker_type == WORKER_GREENLET and Greenlet is None:
+            raise ImportError('Could not import gevent - is it installed?')
 
     @property
     def loglevel(self):
@@ -175,5 +196,7 @@ class ConsumerConfig(namedtuple('_ConsumerConfig', config_keys)):
 
     @property
     def values(self):
-        return dict((key, getattr(self, key)) for key in config_keys
-                    if key not in ('logfile', 'verbose', 'simple_log'))
+        result = dict((key, getattr(self, key)) for key in config_keys
+                      if key not in ('logfile', 'verbose', 'simple_log'))
+        result['worker_type'] = self.normalized_worker_type
+        return result

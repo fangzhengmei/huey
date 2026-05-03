@@ -296,20 +296,8 @@ class Consumer(object):
         self.max_delay = max_delay  # Maximum interval between polling events.
         self.max_tasks = max_tasks  # Max tasks to execute before recycling.
 
-        if max_tasks and not check_worker_health:
-            raise ConfigurationError('max_tasks requires check_worker_health '
-                                     'be enabled.')
-
-        # Ensure that the scheduler runs at an interval between 1 and 60s.
-        self.scheduler_interval = max(min(scheduler_interval, 60), 1)
-        if 60 % self.scheduler_interval != 0:
-            raise ConfigurationError('Scheduler interval must be a factor '
-                                     'of 60, e.g. 1, 2, 3, 4, 5, 6, 10, 12...')
-
-        if worker_type == 'gevent': worker_type = WORKER_GREENLET
-        if worker_type == WORKER_GREENLET and Greenlet is None:
-            raise ImportError('Could not import gevent - is it installed?')
-        self.worker_type = worker_type  # What process model are we using?
+        self.scheduler_interval = scheduler_interval
+        self.worker_type = worker_type
 
         # Configure health-check and consumer main-loop attributes.
         self._stop_flag_timeout = 0.1

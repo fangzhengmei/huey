@@ -2615,3 +2615,409 @@ class TestCustomErrorMetadata(BaseTestCase):
 
         self.assertEqual(self.huey.result_count(), 0)
         self.assertEqual(len(self.huey), 0)
+
+
+class TestTaskTags(BaseTestCase):
+    def test_task_default_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['logging'])
+        def log_message(msg):
+            return 'Logged: %s' % msg
+
+        task1 = send_email.s('test@example.com')
+        task2 = log_message.s('test')
+
+        self.assertEqual(task1.tags, ['important', 'email'])
+        self.assertEqual(task2.tags, ['logging'])
+
+    def test_task_override_tags_at_enqueue(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        task_default = send_email.s('default@example.com')
+        task_override = send_email.s('override@example.com', tags=['urgent', 'notification'])
+
+        self.assertEqual(task_default.tags, ['important', 'email'])
+        self.assertEqual(task_override.tags, ['urgent', 'notification'])
+
+    def test_task_call_override_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        r_default = send_email('default@example.com')
+        r_override = send_email('override@example.com', tags=['urgent', 'notification'])
+
+        task_default = self.huey.dequeue()
+        task_override = self.huey.dequeue()
+
+        self.assertEqual(task_default.tags, ['important', 'email'])
+        self.assertEqual(task_override.tags, ['urgent', 'notification'])
+
+    def test_periodic_task_default_tags(self):
+        @self.huey.periodic_task(crontab(minute='0'), tags=['daily', 'report'])
+        def generate_report():
+            return 'Report generated'
+
+        task = generate_report.s()
+        self.assertEqual(task.tags, ['daily', 'report'])
+
+    def test_pending_by_tags_single_tag(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['important', 'payment'])
+        def process_payment(order_id):
+            return 'Processed payment for order %s' % order_id
+
+        @self.huey.task(tags=['logging'])
+        def log_message(msg):
+            return 'Logged: %s' % msg
+
+        send_email('alice@example.com')
+        process_payment(123)
+        log_message('test message')
+
+        important_tasks = self.huey.pending_by_tags('important')
+        self.assertEqual(len(important_tasks), 2)
+        task_names = sorted([t.name for t in important_tasks])
+        self.assertEqual(task_names, ['process_payment', 'send_email'])
+
+        email_tasks = self.huey.pending_by_tags('email')
+        self.assertEqual(len(email_tasks), 1)
+        self.assertEqual(email_tasks[0].name, 'send_email')
+
+        logging_tasks = self.huey.pending_by_tags('logging')
+        self.assertEqual(len(logging_tasks), 1)
+        self.assertEqual(logging_tasks[0].name, 'log_message')
+
+        nonexistent_tasks = self.huey.pending_by_tags('nonexistent')
+        self.assertEqual(len(nonexistent_tasks), 0)
+
+    def test_pending_by_tags_multiple_tags_or(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['important', 'payment'])
+        def process_payment(order_id):
+            return 'Processed payment for order %s' % order_id
+
+        @self.huey.task(tags=['logging'])
+        def log_message(msg):
+            return 'Logged: %s' % msg
+
+        send_email('alice@example.com')
+        process_payment(123)
+        log_message('test message')
+
+        email_or_payment = self.huey.pending_by_tags(['email', 'payment'])
+        self.assertEqual(len(email_or_payment), 2)
+        task_names = sorted([t.name for t in email_or_payment])
+        self.assertEqual(task_names, ['process_payment', 'send_email'])
+
+        email_or_logging = self.huey.pending_by_tags(['email', 'logging'])
+        self.assertEqual(len(email_or_logging), 2)
+        task_names = sorted([t.name for t in email_or_logging])
+        self.assertEqual(task_names, ['log_message', 'send_email'])
+
+    def test_pending_by_tags_multiple_tags_and(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['important', 'payment'])
+        def process_payment(order_id):
+            return 'Processed payment for order %s' % order_id
+
+        @self.huey.task(tags=['important', 'email', 'notification'])
+        def send_notification(user):
+            return 'Sent notification to %s' % user
+
+        send_email('alice@example.com')
+        process_payment(123)
+        send_notification('bob@example.com')
+
+        important_email = self.huey.pending_by_tags(['important', 'email'], match_all=True)
+        self.assertEqual(len(important_email), 2)
+        task_names = sorted([t.name for t in important_email])
+        self.assertEqual(task_names, ['send_email', 'send_notification'])
+
+        important_email_notification = self.huey.pending_by_tags(
+            ['important', 'email', 'notification'], match_all=True)
+        self.assertEqual(len(important_email_notification), 1)
+        self.assertEqual(important_email_notification[0].name, 'send_notification')
+
+        nonexistent_combination = self.huey.pending_by_tags(
+            ['important', 'nonexistent'], match_all=True)
+        self.assertEqual(len(nonexistent_combination), 0)
+
+    def test_pending_count_by_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['logging'])
+        def log_message(msg):
+            return 'Logged: %s' % msg
+
+        send_email('alice@example.com')
+        send_email('bob@example.com')
+        log_message('test1')
+        log_message('test2')
+        log_message('test3')
+
+        self.assertEqual(self.huey.pending_count_by_tags('important'), 2)
+        self.assertEqual(self.huey.pending_count_by_tags('email'), 2)
+        self.assertEqual(self.huey.pending_count_by_tags('logging'), 3)
+        self.assertEqual(self.huey.pending_count_by_tags('nonexistent'), 0)
+        self.assertEqual(self.huey.pending_count_by_tags(['important', 'email']), 2)
+        self.assertEqual(
+            self.huey.pending_count_by_tags(['important', 'email'], match_all=True), 2)
+
+    def test_pending_by_tags_with_limit(self):
+        @self.huey.task(tags=['important'])
+        def important_task(n):
+            return n
+
+        for i in range(5):
+            important_task(i)
+
+        tasks_all = self.huey.pending_by_tags('important')
+        self.assertEqual(len(tasks_all), 5)
+
+        tasks_limited = self.huey.pending_by_tags('important', limit=2)
+        self.assertEqual(len(tasks_limited), 2)
+
+    def test_task_no_tags(self):
+        @self.huey.task()
+        def regular_task(n):
+            return n + 1
+
+        task = regular_task.s(1)
+        self.assertIsNone(task.tags)
+
+        @self.huey.task(tags=None)
+        def task_with_none_tags(n):
+            return n + 1
+
+        task2 = task_with_none_tags.s(1)
+        self.assertIsNone(task2.tags)
+
+    def test_no_tags_not_matched(self):
+        @self.huey.task()
+        def regular_task(n):
+            return n + 1
+
+        @self.huey.task(tags=['important'])
+        def tagged_task(n):
+            return n + 1
+
+        regular_task(1)
+        tagged_task(2)
+
+        tagged_tasks = self.huey.pending_by_tags('important')
+        self.assertEqual(len(tagged_tasks), 1)
+        self.assertEqual(tagged_tasks[0].name, 'tagged_task')
+
+        regular_tasks = self.huey.pending_by_tags('nonexistent')
+        self.assertEqual(len(regular_tasks), 0)
+
+    def test_message_serialization_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        task = send_email.s('test@example.com', tags=['test1', 'test2'])
+        message = self.huey._registry.create_message(task)
+
+        self.assertEqual(task.tags, ['test1', 'test2'])
+        self.assertEqual(message.tags, ['test1', 'test2'])
+
+        task_deserialized = self.huey._registry.create_task(message)
+        self.assertEqual(task_deserialized.tags, ['test1', 'test2'])
+
+    def test_message_serialization_default_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        task = send_email.s('test@example.com')
+        message = self.huey._registry.create_message(task)
+
+        self.assertEqual(task.tags, ['important', 'email'])
+        self.assertEqual(message.tags, ['important', 'email'])
+
+        task_deserialized = self.huey._registry.create_task(message)
+        self.assertEqual(task_deserialized.tags, ['important', 'email'])
+
+    def test_message_serialization_no_tags(self):
+        @self.huey.task()
+        def regular_task(n):
+            return n + 1
+
+        task = regular_task.s(1)
+        message = self.huey._registry.create_message(task)
+
+        self.assertIsNone(task.tags)
+        self.assertIsNone(message.tags)
+
+        task_deserialized = self.huey._registry.create_task(message)
+        self.assertIsNone(task_deserialized.tags)
+
+    def test_enqueue_dequeue_preserves_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        r = send_email('alice@example.com', tags=['test', 'queue'])
+        task = self.huey.dequeue()
+
+        self.assertEqual(task.tags, ['test', 'queue'])
+        self.assertEqual(task.tags, ['test', 'queue'])
+
+    def test_scheduled_by_tags(self):
+        import datetime
+
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['logging'])
+        def log_message(msg):
+            return 'Logged: %s' % msg
+
+        send_email.schedule('scheduled@test.com', delay=60, tags=['scheduled', 'email'])
+        log_message.schedule('scheduled log', delay=60, tags=['scheduled', 'logging'])
+
+        for _ in range(2):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        self.assertEqual(self.huey.scheduled_count(), 2)
+
+        scheduled_email = self.huey.scheduled_by_tags('email')
+        self.assertEqual(len(scheduled_email), 1)
+        self.assertEqual(scheduled_email[0].tags, ['scheduled', 'email'])
+
+        scheduled_logging = self.huey.scheduled_by_tags('logging')
+        self.assertEqual(len(scheduled_logging), 1)
+        self.assertEqual(scheduled_logging[0].tags, ['scheduled', 'logging'])
+
+        scheduled_all = self.huey.scheduled_by_tags('scheduled')
+        self.assertEqual(len(scheduled_all), 2)
+
+        nonexistent = self.huey.scheduled_by_tags('nonexistent')
+        self.assertEqual(len(nonexistent), 0)
+
+    def test_scheduled_count_by_tags(self):
+        import datetime
+
+        @self.huey.task(tags=['important'])
+        def important_task(n):
+            return n
+
+        for i in range(3):
+            important_task.schedule(i, delay=60, tags=['scheduled', 'important'])
+
+        for _ in range(3):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        self.assertEqual(self.huey.scheduled_count(), 3)
+        self.assertEqual(self.huey.scheduled_count_by_tags('scheduled'), 3)
+        self.assertEqual(self.huey.scheduled_count_by_tags('important'), 3)
+        self.assertEqual(self.huey.scheduled_count_by_tags('nonexistent'), 0)
+
+    def test_scheduled_by_tags_with_limit(self):
+        import datetime
+
+        @self.huey.task(tags=['scheduled'])
+        def scheduled_task(n):
+            return n
+
+        for i in range(5):
+            scheduled_task.schedule(i, delay=60)
+
+        for _ in range(5):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        tasks_all = self.huey.scheduled_by_tags('scheduled')
+        self.assertEqual(len(tasks_all), 5)
+
+        tasks_limited = self.huey.scheduled_by_tags('scheduled', limit=2)
+        self.assertEqual(len(tasks_limited), 2)
+
+    def test_scheduled_by_tags_match_all(self):
+        import datetime
+
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        @self.huey.task(tags=['important', 'notification'])
+        def send_notification(user):
+            return 'Sent notification to %s' % user
+
+        send_email.schedule('test@test.com', delay=60)
+        send_notification.schedule('test@test.com', delay=60)
+
+        for _ in range(2):
+            t = self.huey.dequeue()
+            self.huey.execute(t)
+
+        important_tasks = self.huey.scheduled_by_tags('important')
+        self.assertEqual(len(important_tasks), 2)
+
+        important_email = self.huey.scheduled_by_tags(['important', 'email'], match_all=True)
+        self.assertEqual(len(important_email), 1)
+        self.assertEqual(important_email[0].name, 'send_email')
+
+    def test_reschedule_preserves_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        r = send_email('test@example.com', tags=['original', 'tags'])
+        original_task = self.huey.dequeue()
+        self.assertEqual(original_task.tags, ['original', 'tags'])
+
+        self.huey.enqueue(original_task)
+        r2 = r.reschedule()
+
+        new_task = self.huey.dequeue()
+        self.assertEqual(new_task.tags, ['original', 'tags'])
+
+    def test_reschedule_override_tags(self):
+        @self.huey.task(tags=['important', 'email'])
+        def send_email(user):
+            return 'Sent email to %s' % user
+
+        r = send_email('test@example.com', tags=['original', 'tags'])
+        self.huey.dequeue()
+        self.huey.enqueue(r.task)
+
+        r2 = r.reschedule(tags=['new', 'overridden'])
+
+        new_task = self.huey.dequeue()
+        self.assertEqual(new_task.tags, ['new', 'overridden'])
+
+    def test_task_wrapper_schedule_tags(self):
+        @self.huey.task(tags=['default', 'tags'])
+        def test_task(n):
+            return n + 1
+
+        r_default = test_task.schedule((1,), delay=60)
+        r_override = test_task.schedule((2,), delay=60, tags=['overridden', 'tags'])
+
+        task_default = self.huey.dequeue()
+        task_override = self.huey.dequeue()
+
+        self.assertEqual(task_default.tags, ['default', 'tags'])
+        self.assertEqual(task_override.tags, ['overridden', 'tags'])

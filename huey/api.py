@@ -16,6 +16,7 @@ from functools import wraps
 from huey import signals as S
 from huey.constants import EmptyData
 from huey.consumer import Consumer
+from huey.consumer_options import ConsumerConfig
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import HueyException
@@ -161,7 +162,9 @@ class Huey(object):
                 self.storage = self.create_storage()
 
     def create_consumer(self, **options):
-        return Consumer(self, **options)
+        config = ConsumerConfig(**options)
+        config.validate()
+        return Consumer(self, **config.values)
 
     def task(self, retries=0, retry_delay=0, priority=None, context=False,
              name=None, expires=None, timeout=None, **kwargs):
